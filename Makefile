@@ -1,12 +1,19 @@
 TARGET ?= libnccl-net-mrc.so
+GIN_TARGET ?= libnccl-gin-mrc.so
 
-all:
+all: net gin
+
+net:
 	$(MAKE) -C src OUTPUT=../$(TARGET)
 
-clean:
-	$(MAKE) -C src OUTPUT=../$(TARGET) clean
+# Needs DOCA GPUNetIO and an NCCL_HOME built with GIN_MRC=1.
+gin:
+	$(MAKE) -C src gin GIN_OUTPUT=../$(GIN_TARGET)
 
-test: all
+clean:
+	$(MAKE) -C src OUTPUT=../$(TARGET) GIN_OUTPUT=../$(GIN_TARGET) clean
+
+test: net
 	$(MAKE) -C tests PLUGIN=$(abspath $(TARGET)) test
 
-.PHONY: all clean test
+.PHONY: all net gin clean test
