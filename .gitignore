@@ -8,6 +8,7 @@
 # Build output
 build/
 libnccl-net-mrc.so
+libnccl-gin-mrc.so
 
 # Editor / IDE
 .vscode/*
