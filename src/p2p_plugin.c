@@ -21,16 +21,9 @@
 #include "p2p_plugin.h"
 
 
-extern ncclNet_v11_t ibPlugin_v11;
-extern ncclNet_v10_t ibPlugin_v10;
-extern ncclNet_v9_t ibPlugin_v9;
-extern ncclNet_v8_t ibPlugin_v8;
-extern ncclNet_v7_t ibPlugin_v7;
-extern ncclNet_v6_t ibPlugin_v6;
 pthread_mutex_t nccl_p2p_lock = PTHREAD_MUTEX_INITIALIZER;
 
 ncclDebugLogger_t pluginLogFunction;
-
 
 const char* ibProviderName[] = {
   "None",
@@ -38,6 +31,27 @@ const char* ibProviderName[] = {
 };
 
 NCCL_PARAM(IbDataDirect,"IB_DATA_DIRECT", 1);
+
+#ifdef NCCL_PLUGIN_GIN_ONLY
+// Nothing calls pluginSetup() in the GIN build, and this plugin is IB-only anyway.
+static nccl_p2p_plugin_t p2p_plugin = NCCL_P2P_IB;
+// Normally supplied by net_mrc_plugin.c; keep the names and defaults identical.
+NCCL_PARAM(IbMergeVfs, "IB_MERGE_VFS", 1);
+NCCL_PARAM(IbMergeNics, "IB_MERGE_NICS", 1);
+#else
+static nccl_p2p_plugin_t p2p_plugin = NCCL_P2P_LAST;
+#endif
+
+// The GIN plugin reuses only the device-discovery half of this file; the NET plugin ABI below
+// lives in net_mrc_plugin.c, which it does not link.
+#ifndef NCCL_PLUGIN_GIN_ONLY
+
+extern ncclNet_v11_t ibPlugin_v11;
+extern ncclNet_v10_t ibPlugin_v10;
+extern ncclNet_v9_t ibPlugin_v9;
+extern ncclNet_v8_t ibPlugin_v8;
+extern ncclNet_v7_t ibPlugin_v7;
+extern ncclNet_v6_t ibPlugin_v6;
 
 ncclResult_t pluginInit_v11(void** ctx, uint64_t commId, ncclNetCommConfig_v11_t* config, ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction);
 ncclResult_t pluginInit_v10(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction);
@@ -78,11 +92,7 @@ ncclNet_v6_t ncclNetPlugin_v6 = {
 };
 
 
-static nccl_p2p_plugin_t p2p_plugin = NCCL_P2P_LAST;
-
-
-static void pluginSetup()
-{
+static void pluginSetup(){
   p2p_plugin = NCCL_P2P_IB;
   const char *plugin_path = get_plugin_lib_path();
   if (plugin_path != NULL) {
@@ -145,6 +155,8 @@ ncclResult_t pluginInit_v6(ncclDebugLogger_t logFunction) {
   INFO(NCCL_INIT|NCCL_NET, "P2P plugin %s", ncclNetPlugin_v6.name);
   return ncclNetPlugin_v6.init(logFunction);
 }
+
+#endif /* NCCL_PLUGIN_GIN_ONLY */
 
 // Detect whether GDR can work on a given NIC with the current CUDA device
 // Returns :
