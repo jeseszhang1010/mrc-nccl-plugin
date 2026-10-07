@@ -22,6 +22,7 @@ typedef enum {
   NCCL_NET_DEVICE_GIN_GDAKI = 3,
   NCCL_NET_DEVICE_GIN_GPI = 4,
   NCCL_NET_DEVICE_GIN_EFA_GDA = 5,
+  NCCL_NET_DEVICE_GIN_MRC = 6,
 } ncclNetDeviceType;
 
 typedef struct {
