@@ -331,6 +331,8 @@ struct ncclIbQp {
   // to.
   int remDevIdx;
   struct ncclIbWqeLatMon latMon;
+  // Inline send capacity the provider granted at creation; consulted only when IBV_SEND_INLINE is set.
+  uint32_t maxInlineData;
 };
 
 // We need to support NCCL_NET_MAX_REQUESTS for each concurrent receive
