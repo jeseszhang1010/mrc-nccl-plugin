@@ -264,7 +264,7 @@ ncclResult_t wrap_mrc_create_qp(struct mrc_qp** ret, struct mrc_context* mrcCont
                                 struct mrc_qp_init_attr* qpInitAttr) {
   *ret = mrc_create_qp(mrcContext, qpInitAttr);
   if (*ret == NULL) {
-    WARN("NET/IB : mrc_create_qp failed");
+    WARN("NET/IB : mrc_create_qp failed with error %s", strerror(errno));
     return ncclSystemError;
   }
   return ncclSuccess;
