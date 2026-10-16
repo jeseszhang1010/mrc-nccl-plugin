@@ -1165,7 +1165,7 @@ ib_recv_dev_list:
             "NET/IB: %s: %s %d IbDev %d Port %d qp_num %d mtu %d GID %ld (%lX/%lX) ctsFifoRkey=0x%x ctsFifoLkey=0x%x",
             __func__, comm->base.vProps.ndevs > 2 ? "NCCL MergedDev" : "NCCL Dev", dev, commDev->base.ibDevN,
             ibDev->portNum, meta.qpInfo[q].qpn, devInfo->mtu, (int64_t)commDev->base.gidInfo.localGidIndex,
-            (uint64_t)devInfo->gid.global.subnet_prefix, devInfo->gid.global.interface_id, commDev->ctsFifoMr->rkey,
+            (uint64_t)devInfo->gid.global.subnet_prefix, (uint64_t)devInfo->gid.global.interface_id, commDev->ctsFifoMr->rkey,
             commDev->ctsFifoMr->lkey);
         }
         // Log ECE info
