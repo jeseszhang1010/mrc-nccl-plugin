@@ -45,11 +45,19 @@ resolves it in this order:
 
 ## Building
 
+The tuner has no MRC, CUDA, or NCCL build dependencies. From the repository
+root, build only the tuner with:
+
 ```bash
-make
+make tuner
 ```
 
-This produces `libnccl-tuner-mrc.so`.
+This produces `libnccl-tuner-mrc.so` in the repository root. Running `make`
+(or `make all`) at the repository root builds both the NET and tuner plugins.
+Override the output path with `TUNER_TARGET=/path/to/libnccl-tuner-mrc.so`.
+
+You can also build in this directory with `make -C tuner`, which produces
+`tuner/libnccl-tuner-mrc.so`.
 
 ## Usage
 
@@ -59,7 +67,9 @@ This produces `libnccl-tuner-mrc.so`.
    export NCCL_TUNER_PLUGIN=/path/to/libnccl-tuner-mrc.so
    ```
 
-2. Optionally specify a custom config file (defaults to `nccl_tuner.conf`):
+2. Optionally specify a custom config file. By default the plugin reads
+   `nccl_tuner.conf` from the current working directory; the shipped rules
+   are in `tuner/nccl_tuner.conf`:
 
    ```bash
    export NCCL_TUNER_CONFIG_FILE=/path/to/my_config.conf
@@ -203,10 +213,10 @@ export NCCL_TUNER_COST_MODEL_BW_INTER=30.0
 The `test/` directory contains standalone host-side drivers that include
 `plugin.c` directly, so they build without CUDA or NCCL.
 
-Build the drivers:
+Build the drivers from the repository root:
 
 ```bash
-make test
+make test-tuner
 ```
 
 | Tool | Purpose |
@@ -218,7 +228,8 @@ make test
 Example:
 
 ```bash
-make test
+make test-tuner
+cd tuner
 ./test/csv_tuning_main nccl_tuner.conf   # inspect CSV rule matches
 ./test/cost_model_main                   # inspect cost-model winners
 ```
