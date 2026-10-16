@@ -1,10 +1,10 @@
 TARGET ?= libnccl-net-mrc.so
 
 all:
-	$(MAKE) -C src OUTPUT=../$(TARGET)
+	$(MAKE) -C net OUTPUT=../$(TARGET)
 
 clean:
-	$(MAKE) -C src OUTPUT=../$(TARGET) clean
+	$(MAKE) -C net OUTPUT=../$(TARGET) clean
 
 test: all
 	$(MAKE) -C tests PLUGIN=$(abspath $(TARGET)) test
