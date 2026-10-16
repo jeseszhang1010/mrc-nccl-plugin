@@ -8,6 +8,11 @@
 # Build output
 build/
 libnccl-net-mrc.so
+libnccl-tuner-mrc.so
+
+# Tuner test binaries
+tuner/test/csv_tuning_main
+tuner/test/cost_model_main
 
 # Editor / IDE
 .vscode/*
