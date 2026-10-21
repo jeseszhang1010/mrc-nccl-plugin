@@ -28,3 +28,9 @@ Thumbs.db
 
 # Environment
 *.env
+
+# Python / autotune working files
+__pycache__/
+.pytest_cache/
+tuner/autotune/.venv/
+*.db

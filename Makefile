@@ -31,4 +31,10 @@ test: net
 test-tuner:
 	$(MAKE) -C tuner test
 
-.PHONY: all net tuner clean clean-net clean-tuner test test-tuner
+# Tests of the cost-model autotuning toolkit (needs numpy, scipy, pytest;
+# see tuner/autotune/requirements.txt).  PYTHON can point at a venv.
+PYTHON ?= python3
+test-autotune:
+	cd tuner/autotune && $(PYTHON) -m pytest -q
+
+.PHONY: all net tuner clean clean-net clean-tuner test test-tuner test-autotune

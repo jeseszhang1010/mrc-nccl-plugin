@@ -20,6 +20,7 @@
  *                                priced cell plus one per winner:
  *     cell,<coll>,<nRanks>,<nNodes>,<regBuff>,<nBytes>,<algo>,<proto>,<time_us>
  *     winner,<coll>,<nRanks>,<nNodes>,<regBuff>,<nBytes>,<algo>,<proto>,<time_us>
+ *   Used by tuner/autotune for C/Python parity and offline validation.
  */
 
 #define NCCL_TUNER_TEST_MAIN 1

@@ -1,0 +1,227 @@
+NCCL Benchmark Runs: Commands and Captured Logs (test excerpt; paths sanitised)
+
+====================================================================================================
+RUN 1: allreduce-run-R0-0x1.log
+====================================================================================================
+Collective: All-reduce
+Label: R=0 | 0x1
+Nodes: 128
+Ranks: 512
+Groups: 2 x 256
+Case: allreduce-run-R0-0x1
+Benchmark: all_reduce
+Source log: /path/to/allreduce-run-R0-0x1.log
+SHA-256: 0
+Source modified (UTC): 2026-10-15T19:17:19.529509+00:00
+Evidence status: Complete printed series; zero reported correctness errors; exit code unrecorded
+Registration (-R): 0
+Split mask: 0x1
+P2P disabled: 1
+SHM disabled: 1
+NCCL_ALGO export: Not recorded
+NCCL_PROTO export: Not recorded
+Selected data: cycle 3; 21 printed rows / 21 message sizes
+
+CAPTURED HISTORICAL MPI COMMAND LINE
+----------------------------------------------------------------------------------------------------
+mpirun -np 512 --allow-run-as-root --map-by ppr:4:node --bind-to none --mca plm_rsh_no_tree_spawn 1 --mca plm_rsh_num_concurrent 8192 --mca plm_rsh_args '-o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=8' --mca pml ob1 --mca btl_tcp_if_include enP22p1s0f1 --mca coll_hcoll_enable 0 --mca btl tcp,vader,self --hostfile /path/to/benchmark-nccl-runs/hostfile -x LD_LIBRARY_PATH -x NCCL_TOPO_FILE=/opt/microsoft/mrc/config/nccl-topo-gb200.xml -x NCCL_SOCKET_IFNAME=enP22p1s0f1 -x NCCL_IB_DISABLE=0 -x NCCL_SHM_DISABLE=1 -x NCCL_P2P_DISABLE=1 -x NCCL_MNNVL_ENABLE=0 -x NCCL_IB_ECE_ENABLE=0 -x NCCL_IB_GID_INDEX=3 -x NCCL_NVLS_ENABLE=0 -x NCCL_GDR_FLUSH_DISABLE=1 -x NCCL_GDRCOPY_ENABLE=1 -x NCCL_GDRCOPY_SYNC_ENABLE=1 -x NCCL_IB_QPS_PER_CONNECTION=2 -x NCCL_IB_SPLIT_DATA_ON_QPS=1 -x NCCL_TESTS_SPLIT_MASK=0x1 -x NCCL_IB_USE_INLINE=0 -x NCCL_DEBUG=WARN -x NCCL_DEBUG_SUBSYS=INIT,NET -x UCX_TLS=tcp -x UCX_NET_DEVICES=enP22p1s0f1 -x NCCL_IB_TC=4 -x NCCL_IB_FIFO_TC=12 -x NV_MRC_POST_SEND_PREFER_BF=1 -x NCCL_NET_PLUGIN=/opt/microsoft/mrc/mrc-nccl-plugin/libnccl-net-mrc.so -x NCCL_TUNER_PLUGIN=none -x CUDA_VISIBLE_DEVICES=0,1,2,3 -x NCCL_IB_HCA==mlx5_1,mlx5_0,mlx5_3,mlx5_2 -x NCCL_NET=MRC /bin/bash /path/to/benchmark-nccl-runs/temprun/numa-bind.sh --cpu_bind_range 36-71,0-35,108-143,72-107 --mem_bind 0,0,1,1 /opt/nccl-tests/build/all_reduce_perf -b 4K -f 2 -e 4G -g 1 -c 1 -R 0 -w 50 -n 50 -N 3
+
+CAPTURED LOG OUTPUT
+----------------------------------------------------------------------------------------------------
+Source line: original nccl-tests row (OOP and IP columns)
+2742:         4096          1024     float     sum      -1   183.66    0.02    0.04       0   182.89    0.02    0.04       0
+2743:         8192          2048     float     sum      -1   191.69    0.04    0.09       0   191.84    0.04    0.09       0
+2744:        16384          4096     float     sum      -1   198.94    0.08    0.16       0   197.96    0.08    0.16       0
+2745:        32768          8192     float     sum      -1   224.81    0.15    0.29       0   223.82    0.15    0.29       0
+2746:        65536         16384     float     sum      -1   261.97    0.25    0.50       0   262.02    0.25    0.50       0
+2747:       131072         32768     float     sum      -1   332.73    0.39    0.78       0   348.26    0.38    0.75       0
+2748:       262144         65536     float     sum      -1   262.95    1.00    1.99       0   273.59    0.96    1.91       0
+2749:       524288        131072     float     sum      -1   291.60    1.80    3.58       0   291.32    1.80    3.59       0
+2750:      1048576        262144     float     sum      -1   345.51    3.03    6.05       0   345.10    3.04    6.05       0
+2751:      2097152        524288     float     sum      -1   559.03    3.75    7.47       0   588.54    3.56    7.10       0
+2752:      4194304       1048576     float     sum      -1  1028.83    4.08    8.12       0  1051.89    3.99    7.94       0
+2753:      8388608       2097152     float     sum      -1  2063.85    4.06    8.10       0  1995.11    4.20    8.38       0
+2754:     16777216       4194304     float     sum      -1  3884.84    4.32    8.60       0  3877.43    4.33    8.62       0
+2755:     33554432       8388608     float     sum      -1  7655.59    4.38    8.73       0  7630.11    4.40    8.76       0
+2756:     67108864      16777216     float     sum      -1  2438.64   27.52   54.82       0  2443.14   27.47   54.72       0
+2757:    134217728      33554432     float     sum      -1  4179.89   32.11   63.97       0  4184.01   32.08   63.91       0
+2758:    268435456      67108864     float     sum      -1  10427.5   25.74   51.29       0  10417.8   25.77   51.33       0
+2759:    536870912     134217728     float     sum      -1  13766.2   39.00   77.69       0  13826.1   38.83   77.36       0
+2760:   1073741824     268435456     float     sum      -1  24305.7   44.18   88.01       0  24312.5   44.16   87.98       0
+2761:   2147483648     536870912     float     sum      -1  45181.7   47.53   94.69       0  45175.2   47.54   94.70       0
+2762:   4294967296    1073741824     float     sum      -1  90018.4   47.71   95.05       0  89990.5   47.73   95.08       0
+
+CAPTURED ENVIRONMENT
+----------------------------------------------------------------------------------------------------
+{
+  "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+  "NCCL_DEBUG": "WARN",
+  "NCCL_DEBUG_SUBSYS": "INIT,NET",
+  "NCCL_GDRCOPY_ENABLE": "1",
+  "NCCL_GDRCOPY_SYNC_ENABLE": "1",
+  "NCCL_GDR_FLUSH_DISABLE": "1",
+  "NCCL_IB_DISABLE": "0",
+  "NCCL_IB_ECE_ENABLE": "0",
+  "NCCL_IB_FIFO_TC": "12",
+  "NCCL_IB_GID_INDEX": "3",
+  "NCCL_IB_HCA": "=mlx5_1,mlx5_0,mlx5_3,mlx5_2",
+  "NCCL_IB_QPS_PER_CONNECTION": "2",
+  "NCCL_IB_SPLIT_DATA_ON_QPS": "1",
+  "NCCL_IB_TC": "4",
+  "NCCL_IB_USE_INLINE": "0",
+  "NCCL_MNNVL_ENABLE": "0",
+  "NCCL_NET": "MRC",
+  "NCCL_NET_PLUGIN": "/opt/microsoft/mrc/mrc-nccl-plugin/libnccl-net-mrc.so",
+  "NCCL_NVLS_ENABLE": "0",
+  "NCCL_P2P_DISABLE": "1",
+  "NCCL_SHM_DISABLE": "1",
+  "NCCL_SOCKET_IFNAME": "enP22p1s0f1",
+  "NCCL_TESTS_SPLIT_MASK": "0x1",
+  "NCCL_TOPO_FILE": "/opt/microsoft/mrc/config/nccl-topo-gb200.xml",
+  "NCCL_TUNER_PLUGIN": "none",
+  "NV_MRC_POST_SEND_PREFER_BF": "1",
+  "UCX_NET_DEVICES": "enP22p1s0f1",
+  "UCX_TLS": "tcp"
+}
+
+====================================================================================================
+RUN 2: alltoall-run-debug.log
+====================================================================================================
+Collective: All-reduce
+Label: Debug | R=1 | 0x1 | P2P off | TREE/SIMPLE exports
+Nodes: 128
+Ranks: 512
+Groups: 2 x 256
+Case: alltoall-run-debug
+Benchmark: all_reduce
+Source log: /path/to/alltoall-run-debug.log
+SHA-256: 0
+Source modified (UTC): 2026-10-16T00:39:52.497438+00:00
+Evidence status: Complete printed series; zero reported correctness errors; exit code unrecorded
+Registration (-R): 1
+Split mask: 0x1
+P2P disabled: 1
+SHM disabled: 1
+NCCL_ALGO export: TREE
+NCCL_PROTO export: SIMPLE
+Selected data: cycle 3; 21 printed rows / 21 message sizes
+Source note: Filename suggests all-to-all, but the captured command and collective start/completion markers identify all_reduce_perf (All-reduce).
+
+CAPTURED HISTORICAL MPI COMMAND LINE
+----------------------------------------------------------------------------------------------------
+mpirun -np 512 --allow-run-as-root --map-by ppr:4:node --bind-to none --mca plm_rsh_no_tree_spawn 1 --mca plm_rsh_num_concurrent 8192 --mca plm_rsh_args '-o BatchMode=yes -o ForwardAgent=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=8' --mca pml ob1 --mca btl_tcp_if_include enP22p1s0f1 --mca coll_hcoll_enable 0 --mca btl tcp,vader,self --hostfile /path/to/benchmark-nccl-runs/hostfile -x LD_LIBRARY_PATH -x NCCL_TOPO_FILE=/opt/microsoft/mrc/config/nccl-topo-gb200.xml -x NCCL_SOCKET_IFNAME=enP22p1s0f1 -x NCCL_IB_DISABLE=0 -x NCCL_SHM_DISABLE=1 -x NCCL_P2P_DISABLE=1 -x NCCL_MNNVL_ENABLE=0 -x NCCL_IB_ECE_ENABLE=0 -x NCCL_IB_GID_INDEX=3 -x NCCL_NVLS_ENABLE=0 -x NCCL_GDR_FLUSH_DISABLE=1 -x NCCL_GDRCOPY_ENABLE=1 -x NCCL_GDRCOPY_SYNC_ENABLE=1 -x NCCL_IB_QPS_PER_CONNECTION=2 -x NCCL_IB_SPLIT_DATA_ON_QPS=1 -x NCCL_TESTS_SPLIT_MASK=0x1 -x NCCL_IB_USE_INLINE=0 -x NCCL_DEBUG=WARN -x NCCL_DEBUG_SUBSYS=INIT,NET -x NCCL_ALGO=TREE -x NCCL_PROTO=SIMPLE -x UCX_TLS=tcp -x UCX_NET_DEVICES=enP22p1s0f1 -x NCCL_IB_TC=4 -x NCCL_IB_FIFO_TC=12 -x NV_MRC_POST_SEND_PREFER_BF=1 -x NCCL_NET_PLUGIN=/opt/microsoft/mrc/mrc-nccl-plugin/libnccl-net-mrc.so -x NCCL_TUNER_PLUGIN=none -x CUDA_VISIBLE_DEVICES=0,1,2,3 -x NCCL_IB_HCA==mlx5_1,mlx5_0,mlx5_3,mlx5_2 -x NCCL_NET=MRC /bin/bash /path/to/benchmark-nccl-runs/temprun/numa-bind.sh --cpu_bind_range 36-71,0-35,108-143,72-107 --mem_bind 0,0,1,1 /opt/nccl-tests/build/all_reduce_perf -b 4K -f 2 -e 4G -g 1 -c 1 -R 1 -w 50 -n 50 -N 3
+
+CAPTURED LOG OUTPUT
+----------------------------------------------------------------------------------------------------
+Source line: original nccl-tests row (OOP and IP columns)
+2743:         4096          1024     float     sum      -1   230.95    0.02    0.04       0   231.43    0.02    0.04       0
+2744:         8192          2048     float     sum      -1   246.41    0.03    0.07       0   247.90    0.03    0.07       0
+2745:        16384          4096     float     sum      -1   275.03    0.06    0.12       0   260.26    0.06    0.13       0
+2746:        32768          8192     float     sum      -1   282.91    0.12    0.23       0   275.83    0.12    0.24       0
+2747:        65536         16384     float     sum      -1   286.12    0.23    0.46       0   285.38    0.23    0.46       0
+2748:       131072         32768     float     sum      -1   301.71    0.43    0.87       0   297.57    0.44    0.88       0
+2749:       262144         65536     float     sum      -1   328.66    0.80    1.59       0   329.70    0.80    1.58       0
+2750:       524288        131072     float     sum      -1   374.87    1.40    2.79       0   382.03    1.37    2.73       0
+2751:      1048576        262144     float     sum      -1   470.05    2.23    4.44       0   467.24    2.24    4.47       0
+2752:      2097152        524288     float     sum      -1   677.39    3.10    6.17       0   683.50    3.07    6.11       0
+2753:      4194304       1048576     float     sum      -1  1101.56    3.81    7.59       0  1095.58    3.83    7.63       0
+2754:      8388608       2097152     float     sum      -1  1162.15    7.22   14.38       0  1143.87    7.33   14.61       0
+2755:     16777216       4194304     float     sum      -1  1358.08   12.35   24.61       0  1345.50   12.47   24.84       0
+2756:     33554432       8388608     float     sum      -1  1675.39   20.03   39.90       0  1665.90   20.14   40.13       0
+2757:     67108864      16777216     float     sum      -1  2450.44   27.39   54.56       0  2463.54   27.24   54.27       0
+2758:    134217728      33554432     float     sum      -1  4253.00   31.56   62.87       0  4258.28   31.52   62.79       0
+2759:    268435456      67108864     float     sum      -1  7340.48   36.57   72.85       0  7355.75   36.49   72.70       0
+2760:    536870912     134217728     float     sum      -1  13050.2   41.14   81.96       0  13036.1   41.18   82.05       0
+2761:   1073741824     268435456     float     sum      -1  24501.6   43.82   87.30       0  24525.9   43.78   87.22       0
+2762:   2147483648     536870912     float     sum      -1  47328.8   45.37   90.39       0  47355.4   45.35   90.34       0
+2763:   4294967296    1073741824     float     sum      -1  92836.1   46.26   92.17       0  92923.9   46.22   92.08       0
+
+CAPTURED ENVIRONMENT
+----------------------------------------------------------------------------------------------------
+{
+  "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+  "NCCL_ALGO": "TREE",
+  "NCCL_DEBUG": "WARN",
+  "NCCL_DEBUG_SUBSYS": "INIT,NET",
+  "NCCL_GDRCOPY_ENABLE": "1",
+  "NCCL_GDRCOPY_SYNC_ENABLE": "1",
+  "NCCL_GDR_FLUSH_DISABLE": "1",
+  "NCCL_IB_DISABLE": "0",
+  "NCCL_IB_ECE_ENABLE": "0",
+  "NCCL_IB_FIFO_TC": "12",
+  "NCCL_IB_GID_INDEX": "3",
+  "NCCL_IB_HCA": "=mlx5_1,mlx5_0,mlx5_3,mlx5_2",
+  "NCCL_IB_QPS_PER_CONNECTION": "2",
+  "NCCL_IB_SPLIT_DATA_ON_QPS": "1",
+  "NCCL_IB_TC": "4",
+  "NCCL_IB_USE_INLINE": "0",
+  "NCCL_MNNVL_ENABLE": "0",
+  "NCCL_NET": "MRC",
+  "NCCL_NET_PLUGIN": "/opt/microsoft/mrc/mrc-nccl-plugin/libnccl-net-mrc.so",
+  "NCCL_NVLS_ENABLE": "0",
+  "NCCL_P2P_DISABLE": "1",
+  "NCCL_PROTO": "SIMPLE",
+  "NCCL_SHM_DISABLE": "1",
+  "NCCL_SOCKET_IFNAME": "enP22p1s0f1",
+  "NCCL_TESTS_SPLIT_MASK": "0x1",
+  "NCCL_TOPO_FILE": "/opt/microsoft/mrc/config/nccl-topo-gb200.xml",
+  "NCCL_TUNER_PLUGIN": "none",
+  "NV_MRC_POST_SEND_PREFER_BF": "1",
+  "UCX_NET_DEVICES": "enP22p1s0f1",
+  "UCX_TLS": "tcp"
+}
+
+====================================================================================================
+RUN 3: sendrecv-run-R1-0x3.log
+====================================================================================================
+Collective: Sendrecv
+Label: R=1 | 0x3
+Nodes: 128
+Ranks: 512
+Groups: 4 x 128
+Case: sendrecv-run-R1-0x3
+Benchmark: sendrecv
+Source log: /path/to/sendrecv-run-R1-0x3.log
+SHA-256: 0
+Source modified (UTC): 2026-10-15T19:01:56.562725+00:00
+Evidence status: Complete printed series; zero reported correctness errors; exit code unrecorded
+Registration (-R): 1
+Split mask: Not recorded
+P2P disabled: Not recorded
+SHM disabled: Not recorded
+NCCL_ALGO export: Not recorded
+NCCL_PROTO export: Not recorded
+Selected data: cycle 3; 21 printed rows / 21 message sizes
+
+CAPTURED HISTORICAL MPI COMMAND LINE
+----------------------------------------------------------------------------------------------------
+[Not recorded in source report]
+
+CAPTURED LOG OUTPUT
+----------------------------------------------------------------------------------------------------
+Source line: original nccl-tests row (OOP and IP columns)
+2743:         4096          1024     float     sum      -1    27.03    0.15    0.15       0    27.03    0.15    0.15    N/A
+2744:         8192          2048     float     sum      -1    27.62    0.30    0.30       0    27.58    0.30    0.30    N/A
+2745:        16384          4096     float     sum      -1    28.36    0.58    0.58       0    28.30    0.58    0.58    N/A
+2746:        32768          8192     float     sum      -1    28.61    1.15    1.15       0    28.68    1.14    1.14    N/A
+2747:        65536         16384     float     sum      -1    28.97    2.26    2.26       0    28.86    2.27    2.27    N/A
+2748:       131072         32768     float     sum      -1    29.60    4.43    4.43       0    29.63    4.42    4.42    N/A
+2749:       262144         65536     float     sum      -1    31.00    8.46    8.46       0    31.00    8.46    8.46    N/A
+2750:       524288        131072     float     sum      -1    33.82   15.50   15.50       0    33.77   15.52   15.52    N/A
+2751:      1048576        262144     float     sum      -1    39.28   26.69   26.69       0    39.49   26.55   26.55    N/A
+2752:      2097152        524288     float     sum      -1    51.01   41.11   41.11       0    50.37   41.63   41.63    N/A
+2753:      4194304       1048576     float     sum      -1    72.73   57.67   57.67       0    72.85   57.57   57.57    N/A
+2754:      8388608       2097152     float     sum      -1   117.16   71.60   71.60       0   117.05   71.67   71.67    N/A
+2755:     16777216       4194304     float     sum      -1   203.89   82.29   82.29       0   204.16   82.18   82.18    N/A
+2756:     33554432       8388608     float     sum      -1   379.06   88.52   88.52       0   379.35   88.45   88.45    N/A
+2757:     67108864      16777216     float     sum      -1   730.47   91.87   91.87       0   729.43   92.00   92.00    N/A
+2758:    134217728      33554432     float     sum      -1  1434.06   93.59   93.59       0  1432.80   93.68   93.68    N/A
+2759:    268435456      67108864     float     sum      -1  2835.62   94.67   94.67       0  2834.94   94.69   94.69    N/A
+2760:    536870912     134217728     float     sum      -1  5639.58   95.20   95.20       0  5637.74   95.23   95.23    N/A
+2761:   1073741824     268435456     float     sum      -1  11246.5   95.47   95.47       0  11243.9   95.50   95.50    N/A
+2762:   2147483648     536870912     float     sum      -1  22469.8   95.57   95.57       0  22465.4   95.59   95.59    N/A
+2763:   4294967296    1073741824     float     sum      -1  44932.0   95.59   95.59       0  44924.2   95.60   95.60    N/A
+
+CAPTURED ENVIRONMENT
+----------------------------------------------------------------------------------------------------
+{}

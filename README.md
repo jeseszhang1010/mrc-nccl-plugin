@@ -51,3 +51,5 @@ make tuner
 ```
 
 This creates `libnccl-tuner-mrc.so`. To load it, set `NCCL_TUNER_PLUGIN=/path/to/libnccl-tuner-mrc.so`. See [tuner/README.md](tuner/README.md) for configuration, environment variables, and the test drivers (`make test-tuner`).
+
+[tuner/autotune/](tuner/autotune/README.md) fits the tuner's cost model to measured runs (sweep generation, oracle, fit, codegen, A/B validation); `make test-autotune` runs its tests.
