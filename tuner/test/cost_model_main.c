@@ -8,6 +8,18 @@
  * 
  * For each (topology, collective, message size) the driver populates
  * collCostTable via the cost model and prints the winning (algo, proto, time).
+ *
+ * With no arguments it sweeps the built-in GB200F (mnnvl) topologies.  Options:
+ *   --profile mnnvl|rail_nop2p   parameter set to use (default: mnnvl)
+ *   --topo NRANKS:NNODES         topology to evaluate (repeatable; replaces
+ *                                the built-in list)
+ *   --coll allreduce|allgather|reducescatter   (repeatable; default: all)
+ *   --regbuff 0|1                regBuff passed to the model (default: 0)
+ *   --min-bytes N / --max-bytes N  limit the message-size sweep
+ *   --all-cells                  machine-readable output: one CSV line per
+ *                                priced cell plus one per winner:
+ *     cell,<coll>,<nRanks>,<nNodes>,<regBuff>,<nBytes>,<algo>,<proto>,<time_us>
+ *     winner,<coll>,<nRanks>,<nNodes>,<regBuff>,<nBytes>,<algo>,<proto>,<time_us>
  */
 
 #define NCCL_TUNER_TEST_MAIN 1
@@ -34,7 +46,7 @@ static void formatBytes(size_t b, char* out, size_t n) {
 // [NCCL_NUM_PROTOCOLS] (see nccl/src/enqueue.cc) and passes it as float**.
 // Allocate it the same way (a single contiguous block) so the plugin's 2D
 // indexing matches production.
-static float** allocCostTable(ncclFunc_t coll) {
+static float** allocCostTable(ncclFunc_t coll, size_t nRanks, size_t nNodes) {
   float* flat = (float*)malloc(NCCL_NUM_ALGORITHMS * NCCL_NUM_PROTOCOLS * sizeof(float));
   float (*t)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])flat;
   for (int a = 0; a < NCCL_NUM_ALGORITHMS; a++) {
@@ -50,6 +62,8 @@ static float** allocCostTable(ncclFunc_t coll) {
       } else if (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter) {
         if (a == NCCL_ALGO_RING) valid = 1;
         if (a == NCCL_ALGO_NVLS && p == NCCL_PROTO_SIMPLE) valid = 1;
+        // NCCL offers PAT (SIMPLE only) when every node has a single rank.
+        if (a == NCCL_ALGO_PAT && p == NCCL_PROTO_SIMPLE && nRanks == nNodes) valid = 1;
       }
       t[a][p] = valid ? 1e30f : (float)NCCL_ALGO_PROTO_IGNORE;
     }
@@ -78,21 +92,22 @@ static int findWinner(float** tbl, int* outAlgo, int* outProto, float* outTime) 
   return 1;
 }
 
-static void runOne(ncclFunc_t coll, TunerContext* ctx, size_t nBytes) {
-  float** t = allocCostTable(coll);
-  int n = 0;
+static int applyModel(ncclFunc_t coll, TunerContext* ctx, size_t nBytes, int regBuff, float** t) {
   switch (coll) {
     case ncclFuncAllReduce:
-      n = applyCostModelAllReduce(ctx, nBytes, 1, t, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS);
-      break;
+      return applyCostModelAllReduce(ctx, nBytes, 1, regBuff, t, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS);
     case ncclFuncAllGather:
-      n = applyCostModelAllGather(ctx, nBytes, 1, t, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS);
-      break;
+      return applyCostModelAllGather(ctx, nBytes, 1, regBuff, t, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS);
     case ncclFuncReduceScatter:
-      n = applyCostModelReduceScatter(ctx, nBytes, 1, t, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS);
-      break;
-    default: break;
+      return applyCostModelReduceScatter(ctx, nBytes, 1, regBuff, t, NCCL_NUM_ALGORITHMS, NCCL_NUM_PROTOCOLS);
+    default:
+      return 0;
   }
+}
+
+static void runOne(ncclFunc_t coll, TunerContext* ctx, size_t nBytes) {
+  float** t = allocCostTable(coll, ctx->nRanks, ctx->nNodes);
+  int n = applyModel(coll, ctx, nBytes, 0, t);
   int a = -1, p = -1; float ti = 0.0f;
   char sz[16];
   formatBytes(nBytes, sz, sizeof(sz));
@@ -107,41 +122,86 @@ static void runOne(ncclFunc_t coll, TunerContext* ctx, size_t nBytes) {
   freeCostTable(t);
 }
 
+// Machine-readable variant: every priced cell, then the winner.
+static void runOneAllCells(ncclFunc_t coll, TunerContext* ctx, size_t nBytes, int regBuff) {
+  float** tbl = allocCostTable(coll, ctx->nRanks, ctx->nNodes);
+  int n = applyModel(coll, ctx, nBytes, regBuff, tbl);
+  float (*t)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])tbl;
+  for (int a = 0; a < NCCL_NUM_ALGORITHMS; a++) {
+    for (int p = 0; p < NCCL_NUM_PROTOCOLS; p++) {
+      float v = t[a][p];
+      if (v == (float)NCCL_ALGO_PROTO_IGNORE || v >= 1e29f) continue;
+      printf("cell,%s,%zu,%zu,%d,%zu,%s,%s,%.9g\n", collTypeToString(coll), ctx->nRanks,
+             ctx->nNodes, regBuff, nBytes, algorithmToString(a), protocolToString(p), v);
+    }
+  }
+  int a = -1, p = -1; float ti = 0.0f;
+  if (n > 0 && findWinner(tbl, &a, &p, &ti)) {
+    printf("winner,%s,%zu,%zu,%d,%zu,%s,%s,%.9g\n", collTypeToString(coll), ctx->nRanks,
+           ctx->nNodes, regBuff, nBytes, algorithmToString(a), protocolToString(p), ti);
+  }
+  freeCostTable(tbl);
+}
+
 typedef struct { size_t nRanks; size_t nNodes; } Topology;
+
+static void initContext(TunerContext* ctx, const Topology* topo, const char* profile) {
+  memset(ctx, 0, sizeof(*ctx));
+  ctx->nRanks = topo->nRanks;
+  ctx->nNodes = topo->nNodes;
+  ctx->logFunction = NULL;
+  ctx->costModelProfile = profile;
+  ctx->costModel = *costModelProfileParams(profile);
+  ctx->useCostModel = 1;
+  ctx->numConfigs = 0;
+  ctx->configs = NULL;
+}
 
 static void runCollective(ncclFunc_t coll,
                           const Topology* topos, size_t nTopos,
-                          const size_t* sizes, size_t nSizes) {
-  printf("\n=================================================\n");
-  printf("  Collective: %s\n", collTypeToString(coll));
-  printf("=================================================\n");
+                          const size_t* sizes, size_t nSizes,
+                          const char* profile, int regBuff, int allCells) {
+  if (!allCells) {
+    printf("\n=================================================\n");
+    printf("  Collective: %s\n", collTypeToString(coll));
+    printf("=================================================\n");
+  }
   for (size_t ti = 0; ti < nTopos; ti++) {
     TunerContext ctx;
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.nRanks = topos[ti].nRanks;
-    ctx.nNodes = topos[ti].nNodes;
-    ctx.logFunction = NULL;
-    ctx.costModel = gb200fParamsDefault;
-    ctx.useCostModel = 1;
-    ctx.numConfigs = 0;
-    ctx.configs = NULL;
+    initContext(&ctx, &topos[ti], profile);
 
-    printf("\n--- topology: nRanks=%zu nNodes=%zu (ppn=%zu) ---\n",
-           ctx.nRanks, ctx.nNodes, ctx.nNodes ? ctx.nRanks / ctx.nNodes : 0);
+    if (!allCells) {
+      printf("\n--- topology: nRanks=%zu nNodes=%zu (ppn=%zu) ---\n",
+             ctx.nRanks, ctx.nNodes, ctx.nNodes ? ctx.nRanks / ctx.nNodes : 0);
+    }
     for (size_t si = 0; si < nSizes; si++) {
-      runOne(coll, &ctx, sizes[si]);
+      if (allCells) runOneAllCells(coll, &ctx, sizes[si], regBuff);
+      else runOne(coll, &ctx, sizes[si]);
     }
   }
 }
 
-int main(void) {
-  printf("MRC tuner cost-model sweep (GB200F defaults)\n");
-  printf("--------------------------------------------\n");
+static int parseColl(const char* s, ncclFunc_t* out) {
+  if (strcmp(s, "allreduce") == 0) { *out = ncclFuncAllReduce; return 1; }
+  if (strcmp(s, "allgather") == 0) { *out = ncclFuncAllGather; return 1; }
+  if (strcmp(s, "reducescatter") == 0) { *out = ncclFuncReduceScatter; return 1; }
+  return 0;
+}
 
+static void usage(const char* argv0) {
+  fprintf(stderr,
+          "usage: %s [--profile mnnvl|rail_nop2p] [--topo NRANKS:NNODES]... "
+          "[--coll NAME]... [--regbuff 0|1] [--min-bytes N] [--max-bytes N] [--all-cells]\n",
+          argv0);
+}
+
+#define MAX_CLI_ITEMS 64
+
+int main(int argc, char** argv) {
   // Topology sweep in NCCL's view (one NVLink domain == one NCCL node,
   // ppn up to 64 in a full GB200F NVL domain).  nNodes=1 sweeps the
   // intra-domain fill levels; nNodes>=2 exercises the inter-domain NET path.
-  const Topology topos[] = {
+  const Topology defaultTopos[] = {
     {     8,    1 },    // 2 physical nodes inside one NVL domain
     {    16,    1 },    // 4 physical
     {    32,    1 },    // 8 physical
@@ -153,7 +213,7 @@ int main(void) {
     {  2048,   32 },    // 512 physical
     {  4096,   64 },    // 1024 physical
   };
-  const size_t sizes[] = {
+  const size_t allSizes[] = {
     1ULL << 12,    // 4KB
     1ULL << 13,    // 8KB
     1ULL << 14,    // 16KB
@@ -178,15 +238,74 @@ int main(void) {
     1ULL << 33,    // 8GB
     1ULL << 34,    // 16GB
   };
-  const ncclFunc_t colls[] = {
+  const ncclFunc_t defaultColls[] = {
     ncclFuncAllReduce, ncclFuncAllGather, ncclFuncReduceScatter,
   };
 
-  const size_t nTopos = sizeof(topos) / sizeof(topos[0]);
-  const size_t nSizes = sizeof(sizes) / sizeof(sizes[0]);
-  const size_t nColls = sizeof(colls) / sizeof(colls[0]);
+  const char* profile = "mnnvl";
+  int regBuff = 0, allCells = 0;
+  unsigned long long minBytes = 0, maxBytes = ~0ULL;
+  Topology topos[MAX_CLI_ITEMS];
+  size_t nTopos = 0;
+  ncclFunc_t colls[MAX_CLI_ITEMS];
+  size_t nColls = 0;
+
+  for (int i = 1; i < argc; i++) {
+    const char* arg = argv[i];
+    const char* val = (i + 1 < argc) ? argv[i + 1] : NULL;
+    if (strcmp(arg, "--all-cells") == 0) { allCells = 1; continue; }
+    if (!val) { usage(argv[0]); return 2; }
+    if (strcmp(arg, "--profile") == 0) {
+      if (!costModelProfileParams(val)) { fprintf(stderr, "unknown profile %s\n", val); return 2; }
+      profile = val;
+    } else if (strcmp(arg, "--topo") == 0) {
+      unsigned long r = 0, n = 0;
+      if (sscanf(val, "%lu:%lu", &r, &n) != 2 || r == 0 || n == 0 || nTopos >= MAX_CLI_ITEMS) {
+        fprintf(stderr, "bad --topo %s (want NRANKS:NNODES)\n", val); return 2;
+      }
+      topos[nTopos].nRanks = r; topos[nTopos].nNodes = n; nTopos++;
+    } else if (strcmp(arg, "--coll") == 0) {
+      if (nColls >= MAX_CLI_ITEMS || !parseColl(val, &colls[nColls])) {
+        fprintf(stderr, "bad --coll %s\n", val); return 2;
+      }
+      nColls++;
+    } else if (strcmp(arg, "--regbuff") == 0) {
+      regBuff = atoi(val) ? 1 : 0;
+    } else if (strcmp(arg, "--min-bytes") == 0) {
+      minBytes = strtoull(val, NULL, 0);
+    } else if (strcmp(arg, "--max-bytes") == 0) {
+      maxBytes = strtoull(val, NULL, 0);
+    } else {
+      usage(argv[0]); return 2;
+    }
+    i++;
+  }
+
+  if (nTopos == 0) {
+    nTopos = sizeof(defaultTopos) / sizeof(defaultTopos[0]);
+    memcpy(topos, defaultTopos, sizeof(defaultTopos));
+  }
+  if (nColls == 0) {
+    nColls = sizeof(defaultColls) / sizeof(defaultColls[0]);
+    memcpy(colls, defaultColls, sizeof(defaultColls));
+  }
+  size_t sizes[sizeof(allSizes) / sizeof(allSizes[0])];
+  size_t nSizes = 0;
+  for (size_t i = 0; i < sizeof(allSizes) / sizeof(allSizes[0]); i++) {
+    if (allSizes[i] >= minBytes && allSizes[i] <= maxBytes) sizes[nSizes++] = allSizes[i];
+  }
+
+  if (!allCells) {
+    if (strcmp(profile, "mnnvl") == 0) {
+      printf("MRC tuner cost-model sweep (GB200F defaults)\n");
+      printf("--------------------------------------------\n");
+    } else {
+      printf("MRC tuner cost-model sweep (profile %s, regBuff=%d)\n", profile, regBuff);
+      printf("--------------------------------------------\n");
+    }
+  }
   for (size_t ci = 0; ci < nColls; ci++) {
-    runCollective(colls[ci], topos, nTopos, sizes, nSizes);
+    runCollective(colls[ci], topos, nTopos, sizes, nSizes, profile, regBuff, allCells);
   }
   return 0;
 }

@@ -56,7 +56,27 @@ typedef struct {
   // bandwidth-bound sizes.  Cap ring/SIMPLE per-channel BW so NVLS wins large
   // messages; ring/LL and ring/LL128 (small/mid regime) are left untouched.
   double ringBwCapIntra;
+  // -- PAT (AllGather/ReduceScatter, 1 GPU per node) ------------------------
+  // busBw efficiency applied to nChannels * per-channel BW (NCCL uses 0.75).
+  // 0 disables PAT modelling.
+  double patBwEff;
+  // Linear per-rank PAT latency term in us (NCCL uses 2.8).
+  double patLatPerRank;
+  // -- Registered-buffer BW multipliers -------------------------------------
+  // busBw is multiplied by regBwScale[algo][proto] when NCCL reports
+  // regBuff=1.  0 (unset) is treated as 1.0.
+  double regBwScale[NCCL_NUM_ALGORITHMS][NCCL_NUM_PROTOCOLS];
+  // -- Cell coverage --------------------------------------------------------
+  // When non-zero, valid (non-IGNORE) cells the model cannot price get a large
+  // explicit cost, so NCCL never compares plugin-predicted times against its
+  // own internal estimates.
+  int disableUnmodeledCells;
 } CostModelParams;
+
+// Cost written to valid cells the model cannot price when
+// disableUnmodeledCells is set (us).  Large enough to never win against a
+// priced cell, but distinct from NCCL_ALGO_PROTO_IGNORE.
+#define COST_MODEL_DISABLED_COST 1.0e9f
 
 // Default cost-model parameters for the GB200F platform.
 //
@@ -128,6 +148,86 @@ static const CostModelParams gb200fParamsDefault = {
   /* ringBwCapIntra     */ 17.5,
 };
 
+// Rail profile: MNNVL disabled (every physical node is its own NCCL node) and
+// NCCL_P2P_DISABLE=1 (intra-node traffic also goes over the MRC NET).
+// Parameters calibrated against measured nccl-tests runs at
+// nNodes=[8, 16, 32, 64, 128, 256].
+// When railNoP2pParamsValidated is 1, the profile is auto-selected for matching
+// jobs; when 0, it is used only when selected explicitly via
+// NCCL_TUNER_COST_MODEL_PROFILE.
+static const int railNoP2pParamsValidated = 1;
+static const CostModelParams railNoP2pParamsDefault = {
+  /* gpusPerNode        */ 4,
+  /* nChannels          */ 32,
+  /* bwIntra            */ 20.29,
+  /* bwInter            */ 4.29211,
+  /* nvlsEfficiency     */ 0.4674,
+  /* graphLatencyInter  */ 0.0,
+  /* baseLatencies [algo][LL, LL128, SIMPLE] */
+  {
+    /* tree           */ {   20.6679,   26.3192,   25.6124 },
+    /* ring           */ { 1.91189e-09, 2.05101e-08, 1.09204e-10 },
+    /* collnet_direct */ {       0.0,       0.0,       0.0 },
+    /* collnet_chain  */ {       0.0,       0.0,       0.0 },
+    /* nvls           */ {       0.0,       0.0,       0.0 },
+    /* nvls_tree      */ {       0.0,       0.0,       0.0 },
+    /* pat            */ {       8.0,       8.0,   32.5934 },
+  },
+  /* hwLatencies [hw][algo][LL, LL128, SIMPLE] */
+  {
+    /* NVLINK */
+    {
+      /* tree           */ {       5.0,       8.5,      14.0 },
+      /* ring           */ {       2.7,       4.0,      14.0 },
+      /* collnet_direct */ {       0.0,       0.0,       0.0 },
+      /* collnet_chain  */ {       0.0,       0.0,       0.0 },
+      /* nvls           */ {       0.0,       0.0,      25.0 },
+      /* nvls_tree      */ {       0.0,       0.0,      25.0 },
+      /* pat            */ {       0.0,       0.0,       4.0 },
+    },
+    /* PCI */
+    {
+      /* tree           */ {       1.0,       1.9,       4.0 },
+      /* ring           */ {       1.0,       2.5,       5.7 },
+      /* collnet_direct */ {       0.0,       0.0,       3.7 },
+      /* collnet_chain  */ {       0.0,       0.0,       2.8 },
+      /* nvls           */ {       0.0,       0.0,       0.0 },
+      /* nvls_tree      */ {       0.0,       0.0,       0.0 },
+      /* pat            */ {       0.0,       0.0,       4.0 },
+    },
+    /* NET */
+    {
+      /* tree           */ {   10.1576,   10.7845,   17.4627 },
+      /* ring           */ {       2.7,       4.0,      14.0 },
+      /* collnet_direct */ {       0.0,       0.0,      31.0 },
+      /* collnet_chain  */ {       0.0,       0.0,      30.0 },
+      /* nvls           */ {       0.0,       0.0,      18.0 },
+      /* nvls_tree      */ {       0.0,       0.0,      20.9 },
+      /* pat            */ {       0.0,       0.0,   6.64092 },
+    },
+  },
+  /* llMaxBw             N1/N2/N4+ */ {     282.0,      90.0,   4.99782 },
+  /* perChMaxRingLL128Bw N1/N2/N4+ */ {      40.0,      40.0,    5.8313 },
+  /* perChMaxTreeBw      N1/N2/N4+ */ {      70.0,      42.8,    2.1473 },
+  /* perChMaxTreeLL128Bw N1/N2/N4+ */ {      55.6,     31.67,  0.890063 },
+  /* perChMaxNVLSTreeBw  N1/N2/N4+ */ {     55.62,     145.7,     137.3 },
+  /* ringBwCapInter     */ 0.0,
+  /* ringBwCapIntra     */ 0.0,
+  /* patBwEff           */ 0.468895,
+  /* patLatPerRank      */ 1.13602,
+  /* regBwScale [algo][LL, LL128, SIMPLE] (regBuff=1 busBw multiplier) */
+  {
+    /* tree           */ {       1.0,       1.0,       1.0 },
+    /* ring           */ {       1.0,       1.0,  0.892386 },
+    /* collnet_direct */ {       1.0,       1.0,       1.0 },
+    /* collnet_chain  */ {       1.0,       1.0,       1.0 },
+    /* nvls           */ {       1.0,       1.0,       1.0 },
+    /* nvls_tree      */ {       1.0,       1.0,       1.0 },
+    /* pat            */ {       1.0,       1.0,       1.0 },
+  },
+  /* disableUnmodeledCells */ 1,
+};
+
 // CSV field indices for configuration parsing
 // Format: colltype,minbytes,maxbytes,algorithm,protocol,channels,nNodes,nRanks,numPipeOps,regBuff
 #define CONFIG_FIELD_COLLTYPE     0
@@ -177,6 +277,8 @@ typedef struct {
   // entirely and uses the cost model directly (still subject to useCostModel).
   int forceCostModel;
   CostModelParams costModel;
+  // Name of the active cost-model profile ("mnnvl" or "rail_nop2p").
+  const char* costModelProfile;
 } TunerContext;
 
 // Parse collective type from string
@@ -400,16 +502,52 @@ static int getEnvInt(const char* name, int defaultValue) {
   return (int)v;
 }
 
+// Returns non-zero if environment variable `name` is set to exactly `value`.
+static int envEquals(const char* name, const char* value) {
+  const char* s = getenv(name);
+  return s && strcmp(s, value) == 0;
+}
+
+// Parameter set for a named cost-model profile, or NULL if unknown.
+static const CostModelParams* costModelProfileParams(const char* name) {
+  if (strcmp(name, "mnnvl") == 0) return &gb200fParamsDefault;
+  if (strcmp(name, "rail_nop2p") == 0) return &railNoP2pParamsDefault;
+  return NULL;
+}
+
+// Pick the cost-model profile for this communicator.
+//   NCCL_TUNER_COST_MODEL_PROFILE=mnnvl|rail_nop2p forces a profile.
+//   Otherwise (unset or "auto"), rail_nop2p is used when railNoP2pParamsValidated
+//   is set AND the job runs with NCCL_MNNVL_ENABLE=0 and
+//   NCCL_P2P_DISABLE=1 across more than one node; mnnvl is used otherwise.
+static const char* selectCostModelProfile(TunerContext* ctx) {
+  const char* req = getenv("NCCL_TUNER_COST_MODEL_PROFILE");
+  if (req && *req && strcmp(req, "auto") != 0) {
+    if (costModelProfileParams(req)) return strcmp(req, "mnnvl") == 0 ? "mnnvl" : "rail_nop2p";
+    if (ctx->logFunction) {
+      ctx->logFunction(NCCL_LOG_WARN, NCCL_TUNING, __FILE__, __LINE__,
+                       "TUNER/MRC: Unknown NCCL_TUNER_COST_MODEL_PROFILE=%s, using auto selection", req);
+    }
+  }
+  if (railNoP2pParamsValidated && ctx->nNodes > 1
+      && envEquals("NCCL_MNNVL_ENABLE", "0") && envEquals("NCCL_P2P_DISABLE", "1")) {
+    return "rail_nop2p";
+  }
+  return "mnnvl";
+}
+
 // Initialise the cost-model state from defaults and environment overrides.
 //   NCCL_TUNER_COST_MODEL              : 1=on (default, fallback for AR/AG/RS), 0=off (strict CSV-only)
 //   NCCL_TUNER_FORCE_COST_MODEL        : 1=skip CSV lookup and use cost model directly, 0=off (default)
+//   NCCL_TUNER_COST_MODEL_PROFILE      : mnnvl | rail_nop2p | auto (default)
 //   NCCL_TUNER_COST_MODEL_CHANNELS     : override default channel count
 //   NCCL_TUNER_COST_MODEL_BW_INTRA     : per-channel intra-node BW (GB/s)
 //   NCCL_TUNER_COST_MODEL_BW_INTER     : per-channel inter-node BW (GB/s)
 //   NCCL_TUNER_COST_MODEL_NVLS_EFF     : NVLS efficiency factor (0..1)
 //   NCCL_TUNER_COST_MODEL_GRAPH_LAT    : per-hop graph inter latency (us)
 static void initCostModel(TunerContext* ctx) {
-  ctx->costModel = gb200fParamsDefault;
+  ctx->costModelProfile = selectCostModelProfile(ctx);
+  ctx->costModel = *costModelProfileParams(ctx->costModelProfile);
   ctx->useCostModel = getEnvInt("NCCL_TUNER_COST_MODEL", 1);
   ctx->forceCostModel = getEnvInt("NCCL_TUNER_FORCE_COST_MODEL", 0);
   // Forcing the cost model implies it must be enabled.
@@ -422,8 +560,9 @@ static void initCostModel(TunerContext* ctx) {
 
   if (ctx->logFunction && ctx->useCostModel) {
     ctx->logFunction(NCCL_LOG_INFO, NCCL_TUNING, __FILE__, __LINE__,
-                     "TUNER/MRC: Cost model ENABLED (GB200F)%s: nChannels=%d bwIntra=%.2fGB/s "
+                     "TUNER/MRC: Cost model ENABLED (profile=%s)%s: nChannels=%d bwIntra=%.2fGB/s "
                      "bwInter=%.2fGB/s nvlsEff=%.3f graphLatInter=%.2fus",
+                     ctx->costModelProfile,
                      ctx->forceCostModel ? " [FORCED, CSV lookup skipped]" : "",
                      ctx->costModel.nChannels, ctx->costModel.bwIntra,
                      ctx->costModel.bwInter, ctx->costModel.nvlsEfficiency,
@@ -575,12 +714,19 @@ static double algoLatency(const CostModelParams* P, int algo, int proto,
   return lat;
 }
 
+// busBw multiplier for registered user buffers (regBuff=1).
+static double regBwScaleFor(const CostModelParams* P, int algo, int proto, int regBuff) {
+  if (!regBuff) return 1.0;
+  double s = P->regBwScale[algo][proto];
+  return (s > 0.0) ? s : 1.0;
+}
+
 // Compute predicted time (microseconds) for an AllReduce of `nBytes` using
 // algorithm `algo` and protocol `proto`.  Returns < 0 if the combination is
 // not supported.  Optionally writes algoBw and busBw (GB/s) into the output
 // pointers for logging / diagnostics.
 static float computeAllReduceTime(TunerContext* ctx, int algo, int proto,
-                                  size_t nBytes, int numPipeOps,
+                                  size_t nBytes, int numPipeOps, int regBuff,
                                   float* outAlgoBw, float* outBusBw) {
   const CostModelParams* P = &ctx->costModel;
   int nRanks = (int)ctx->nRanks;
@@ -611,6 +757,7 @@ static float computeAllReduceTime(TunerContext* ctx, int algo, int proto,
 
   // 2. Protocol / algo BW caps.
   busBw = applyProtocolCap(busBw, algo, proto, P, scale, nNodes, nChannels);
+  busBw *= regBwScaleFor(P, algo, proto, regBuff);
 
   // 3. busBw -> algoBw.
   double algoBw = busBwToAlgoBw(busBw, algo, ncclFuncAllReduce, nRanks);
@@ -631,15 +778,16 @@ static float computeAllReduceTime(TunerContext* ctx, int algo, int proto,
 }
 
 // Shared compute for AllGather / ReduceScatter.  Same fabric model as
-// AllReduce.  NVLS is single-node only (intra-NVL domain).  Returns < 0 for
-// unsupported (coll, algo, proto).
+// AllReduce.  NVLS is single-node only (intra-NVL domain).  PAT is modelled
+// only when the profile sets patBwEff > 0.  Returns < 0 for unsupported
+// (coll, algo, proto).
 //
 // Known conservatism preserved here (defer to a measurement-driven follow-up):
 //   bwIntra/bwInter come from the AllReduce-tuned GB200F params; AG/RS have
 //   no reduction step so achievable BW is mildly higher than AR.
 static float computeAllGatherOrRSTime(TunerContext* ctx, ncclFunc_t coll,
                                       int algo, int proto, size_t nBytes,
-                                      int numPipeOps,
+                                      int numPipeOps, int regBuff,
                                       float* outAlgoBw, float* outBusBw) {
   const CostModelParams* P = &ctx->costModel;
   int nRanks = (int)ctx->nRanks;
@@ -653,12 +801,34 @@ static float computeAllGatherOrRSTime(TunerContext* ctx, ncclFunc_t coll,
   int nChannels = P->nChannels;
   int scale = (nNodes <= 1) ? 0 : (nNodes <= 2 ? 1 : 2);
 
+  // PAT (NCCL: AG/RS only, SIMPLE only, 1 GPU per node).  Mirrors NCCL's own
+  // model: busBw scaled by an efficiency factor and used as algoBw directly
+  // (no busBw->algoBw ratio), latency = base + log2(nNodes) * per-step NET
+  // latency + nRanks * a linear per-rank term.
+  if (algo == NCCL_ALGO_PAT) {
+    if (P->patBwEff <= 0.0 || proto != NCCL_PROTO_SIMPLE || nNodes != nRanks) return -1.0f;
+    double perCh = (nNodes <= 2) ? P->bwIntra : P->bwInter;
+    double busBw = (double)nChannels * perCh * P->patBwEff;
+    busBw *= regBwScaleFor(P, algo, proto, regBuff);
+    double algoBw = busBw;
+    if (algoBw <= 0.0) return -1.0f;
+    double stepLat = P->hwLatencies[NCCL_HW_NET][NCCL_ALGO_PAT][proto] + 2.0 * P->graphLatencyInter;
+    double lat = P->baseLatencies[NCCL_ALGO_PAT][proto]
+               + (double)costLog2i(nNodes) * stepLat
+               + (double)nRanks * P->patLatPerRank;
+    int latCount = (numPipeOps + 3) / 4;
+    if (latCount < 1) latCount = 1;
+    double timeUs = lat * (double)latCount + (double)nBytes / (1000.0 * algoBw);
+    if (outAlgoBw) *outAlgoBw = (float)algoBw;
+    if (outBusBw)  *outBusBw  = (float)busBw;
+    return (float)timeUs;
+  }
+
   // Algorithm gating specific to AG/RS:
   //   NVLS  : single-node only (intra-NVLink domain)
-  //   TREE / NVLS_TREE / PAT : not supported here
+  //   TREE / NVLS_TREE : not supported here
   if (algo == NCCL_ALGO_NVLS && nNodes > 1) return -1.0f;
-  if (algo == NCCL_ALGO_TREE || algo == NCCL_ALGO_NVLS_TREE
-      || algo == NCCL_ALGO_PAT) {
+  if (algo == NCCL_ALGO_TREE || algo == NCCL_ALGO_NVLS_TREE) {
     return -1.0f;
   }
 
@@ -669,6 +839,7 @@ static float computeAllGatherOrRSTime(TunerContext* ctx, ncclFunc_t coll,
 
   // 2. Protocol caps (TREE branch unreached; RING LL/LL128 caps apply).
   busBw = applyProtocolCap(busBw, algo, proto, P, scale, nNodes, nChannels);
+  busBw *= regBwScaleFor(P, algo, proto, regBuff);
 
   // 3. busBw -> algoBw.
   double algoBw = busBwToAlgoBw(busBw, algo, coll, nRanks);
@@ -689,44 +860,52 @@ static float computeAllGatherOrRSTime(TunerContext* ctx, ncclFunc_t coll,
 }
 
 static float computeAllGatherTime(TunerContext* ctx, int algo, int proto,
-                                  size_t nBytes, int numPipeOps,
+                                  size_t nBytes, int numPipeOps, int regBuff,
                                   float* outAlgoBw, float* outBusBw) {
   return computeAllGatherOrRSTime(ctx, ncclFuncAllGather, algo, proto,
-                                  nBytes, numPipeOps, outAlgoBw, outBusBw);
+                                  nBytes, numPipeOps, regBuff, outAlgoBw, outBusBw);
 }
 
 static float computeReduceScatterTime(TunerContext* ctx, int algo, int proto,
-                                      size_t nBytes, int numPipeOps,
+                                      size_t nBytes, int numPipeOps, int regBuff,
                                       float* outAlgoBw, float* outBusBw) {
   return computeAllGatherOrRSTime(ctx, ncclFuncReduceScatter, algo, proto,
-                                  nBytes, numPipeOps, outAlgoBw, outBusBw);
+                                  nBytes, numPipeOps, regBuff, outAlgoBw, outBusBw);
 }
 
 // Generic cost-table populator.  `computeFn` returns time(us) for the given
-// (algo, proto) cell, or < 0 if unsupported.  Untouched cells are left as the
-// caller (NCCL) initialised them.
-typedef float (*ComputeFn)(TunerContext*, int, int, size_t, int, float*, float*);
+// (algo, proto) cell, or < 0 if unsupported.  Cells the model cannot price are
+// left as the caller (NCCL) initialised them, unless the profile sets
+// disableUnmodeledCells: then, provided at least one cell was priced, they get
+// COST_MODEL_DISABLED_COST so NCCL never mixes its own estimates with ours.
+typedef float (*ComputeFn)(TunerContext*, int, int, size_t, int, int, float*, float*);
 
 static int applyCostModelGeneric(TunerContext* ctx, ncclFunc_t coll,
-                                 size_t nBytes, int numPipeOps,
+                                 size_t nBytes, int numPipeOps, int regBuff,
                                  float** collCostTable, int numAlgo, int numProto,
                                  ComputeFn computeFn) {
   if (ctx->logFunction) {
     ctx->logFunction(NCCL_LOG_INFO, NCCL_TUNING, __FILE__, __LINE__,
-                     "TUNER/MRC: cost-model fallback collType=%s nBytes=%zu nRanks=%zu nNodes=%zu",
-                     collTypeToString(coll), nBytes, ctx->nRanks, ctx->nNodes);
+                     "TUNER/MRC: cost-model fallback collType=%s nBytes=%zu nRanks=%zu nNodes=%zu regBuff=%d profile=%s",
+                     collTypeToString(coll), nBytes, ctx->nRanks, ctx->nNodes, regBuff,
+                     ctx->costModelProfile ? ctx->costModelProfile : "mnnvl");
   }
   int populated = 0;
+  int unpriced[NCCL_NUM_ALGORITHMS * NCCL_NUM_PROTOCOLS];
+  int nUnpriced = 0;
   // NCCL core passes collCostTable as a contiguous float[numAlgo][numProto]
   // (see nccl/src/enqueue.cc), so it must be indexed as a 2D array rather than
   // an array of row pointers — same convention as the CSV path above.
   float (*table)[NCCL_NUM_PROTOCOLS] = (float (*)[NCCL_NUM_PROTOCOLS])collCostTable;
-  for (int a = 0; a < numAlgo; a++) {
-    for (int p = 0; p < numProto; p++) {
+  for (int a = 0; a < numAlgo && a < NCCL_NUM_ALGORITHMS; a++) {
+    for (int p = 0; p < numProto && p < NCCL_NUM_PROTOCOLS; p++) {
       if (table[a][p] == NCCL_ALGO_PROTO_IGNORE) continue;
       float algoBw = 0.0f, busBw = 0.0f;
-      float t = computeFn(ctx, a, p, nBytes, numPipeOps, &algoBw, &busBw);
-      if (t < 0.0f) continue;
+      float t = computeFn(ctx, a, p, nBytes, numPipeOps, regBuff, &algoBw, &busBw);
+      if (t < 0.0f) {
+        unpriced[nUnpriced++] = a * NCCL_NUM_PROTOCOLS + p;
+        continue;
+      }
       table[a][p] = t;
       populated++;
       if (ctx->logFunction) {
@@ -739,29 +918,41 @@ static int applyCostModelGeneric(TunerContext* ctx, ncclFunc_t coll,
       }
     }
   }
+  if (populated > 0 && ctx->costModel.disableUnmodeledCells) {
+    for (int i = 0; i < nUnpriced; i++) {
+      int a = unpriced[i] / NCCL_NUM_PROTOCOLS, p = unpriced[i] % NCCL_NUM_PROTOCOLS;
+      table[a][p] = COST_MODEL_DISABLED_COST;
+      if (ctx->logFunction) {
+        ctx->logFunction(NCCL_LOG_TRACE, NCCL_TUNING, __FILE__, __LINE__,
+                         "TUNER/MRC: CostModel %s nBytes=%zu algo=%s proto=%s not modelled; disabled",
+                         collTypeToString(coll), nBytes,
+                         algorithmToString(a), protocolToString(p));
+      }
+    }
+  }
   return populated;
 }
 
 static int applyCostModelAllReduce(TunerContext* ctx, size_t nBytes,
-                                   int numPipeOps, float** collCostTable,
+                                   int numPipeOps, int regBuff, float** collCostTable,
                                    int numAlgo, int numProto) {
-  return applyCostModelGeneric(ctx, ncclFuncAllReduce, nBytes, numPipeOps,
+  return applyCostModelGeneric(ctx, ncclFuncAllReduce, nBytes, numPipeOps, regBuff,
                                collCostTable, numAlgo, numProto,
                                computeAllReduceTime);
 }
 
 static int applyCostModelAllGather(TunerContext* ctx, size_t nBytes,
-                                   int numPipeOps, float** collCostTable,
+                                   int numPipeOps, int regBuff, float** collCostTable,
                                    int numAlgo, int numProto) {
-  return applyCostModelGeneric(ctx, ncclFuncAllGather, nBytes, numPipeOps,
+  return applyCostModelGeneric(ctx, ncclFuncAllGather, nBytes, numPipeOps, regBuff,
                                collCostTable, numAlgo, numProto,
                                computeAllGatherTime);
 }
 
 static int applyCostModelReduceScatter(TunerContext* ctx, size_t nBytes,
-                                       int numPipeOps, float** collCostTable,
+                                       int numPipeOps, int regBuff, float** collCostTable,
                                        int numAlgo, int numProto) {
-  return applyCostModelGeneric(ctx, ncclFuncReduceScatter, nBytes, numPipeOps,
+  return applyCostModelGeneric(ctx, ncclFuncReduceScatter, nBytes, numPipeOps, regBuff,
                                collCostTable, numAlgo, numProto,
                                computeReduceScatterTime);
 }
@@ -872,15 +1063,15 @@ __hidden ncclResult_t pluginGetCollInfo(void* context, ncclFunc_t collType, size
     int n = 0;
     switch (collType) {
       case ncclFuncAllReduce:
-        n = applyCostModelAllReduce(ctx, nBytes, numPipeOps,
+        n = applyCostModelAllReduce(ctx, nBytes, numPipeOps, regBuff,
                                     collCostTable, numAlgo, numProto);
         break;
       case ncclFuncAllGather:
-        n = applyCostModelAllGather(ctx, nBytes, numPipeOps,
+        n = applyCostModelAllGather(ctx, nBytes, numPipeOps, regBuff,
                                     collCostTable, numAlgo, numProto);
         break;
       case ncclFuncReduceScatter:
-        n = applyCostModelReduceScatter(ctx, nBytes, numPipeOps,
+        n = applyCostModelReduceScatter(ctx, nBytes, numPipeOps, regBuff,
                                         collCostTable, numAlgo, numProto);
         break;
       default:

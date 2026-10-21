@@ -171,7 +171,31 @@ node).
 
 Other collectives fall through to NCCL's internal tuner. Plain `nvls` is
 intra-NVL-domain only (it cannot span multiple NCCL nodes); `nvls_tree` is the
-high-bandwidth inter-domain path.
+high-bandwidth inter-domain path. The `rail_nop2p` profile (below) also models
+`pat` for AllGather/ReduceScatter when every node has a single rank.
+
+### Profiles
+
+The cost model has two parameter sets in `plugin.c`:
+
+| Profile | Used for | Parameters |
+|---------|----------|------------|
+| `mnnvl` | GB200F with MNNVL: one NCCL node = one NVLink domain | `gb200fParamsDefault` (hand-calibrated) |
+| `rail_nop2p` | `NCCL_MNNVL_ENABLE=0` and `NCCL_P2P_DISABLE=1`: one NCCL node = one physical node, intra-node traffic over the MRC NET | `railNoP2pParamsDefault` (calibrated against measured nccl-tests runs) |
+
+`NCCL_TUNER_COST_MODEL_PROFILE=mnnvl|rail_nop2p` forces a profile. Unset (or
+`auto`), the plugin selects `rail_nop2p` only when the job runs with
+`NCCL_MNNVL_ENABLE=0` and `NCCL_P2P_DISABLE=1` across more than one node AND
+`railNoP2pParamsValidated = 1` in `plugin.c`. Otherwise it uses `mnnvl`.
+
+The `rail_nop2p` profile differs from `mnnvl` in three ways:
+- **PAT:** it prices `pat` (AllGather/ReduceScatter, SIMPLE, one rank per
+  node) with NCCL's PAT model shape.
+- **regBuff:** it can scale bandwidth for registered buffers (`regBuff=1`,
+  e.g. nccl-tests `-R 1`) per (algo, proto) via `regBwScale`.
+- **Cell coverage:** it sets `disableUnmodeledCells`, so any valid cell it
+  cannot price gets a large explicit cost instead of keeping NCCL's own
+  estimate. That way NCCL never compares plugin times with its own.
 
 ### Environment variables
 
@@ -179,6 +203,7 @@ high-bandwidth inter-domain path.
 |----------|---------|---------|
 | `NCCL_TUNER_COST_MODEL` | `1` | `1`=cost model on (fallback for AR/AG/RS); `0`=strict CSV-only |
 | `NCCL_TUNER_FORCE_COST_MODEL` | `0` | `1`=skip CSV lookup and use the cost model directly (implies the model is on) |
+| `NCCL_TUNER_COST_MODEL_PROFILE` | `auto` | `mnnvl`, `rail_nop2p` or `auto` (see Profiles) |
 | `NCCL_TUNER_COST_MODEL_CHANNELS` | platform default (32) | Override the default channel count |
 | `NCCL_TUNER_COST_MODEL_BW_INTRA` | platform default | Per-channel intra-domain (NVLink) BW in GB/s |
 | `NCCL_TUNER_COST_MODEL_BW_INTER` | platform default | Per-channel inter-domain (backend MRC/NET) BW in GB/s |
@@ -222,7 +247,7 @@ make test-tuner
 | Tool | Purpose |
 |------|---------|
 | `test/csv_tuning_main` | Exercises the CSV path — prints the pinned `(algo, proto, channels)` per point, or `(no match)`. Pass a config path as the first argument (defaults to `nccl_tuner.conf`). |
-| `test/cost_model_main` | Runs the cost model across a topology/size sweep and prints the winning `(algo, proto, time_us)`. |
+| `test/cost_model_main` | Runs the cost model across a topology/size sweep and prints the winning `(algo, proto, time_us)`. Options: `--profile mnnvl\|rail_nop2p`, `--topo NRANKS:NNODES` (repeatable), `--coll NAME` (repeatable), `--regbuff 0\|1`, `--min-bytes/--max-bytes N`, and `--all-cells` for one CSV line per priced cell plus the winner. |
 
 
 Example:
@@ -232,6 +257,7 @@ make test-tuner
 cd tuner
 ./test/csv_tuning_main nccl_tuner.conf   # inspect CSV rule matches
 ./test/cost_model_main                   # inspect cost-model winners
+./test/cost_model_main --profile rail_nop2p --topo 256:128 --coll allreduce
 ```
 
 ## Adding Configurations
