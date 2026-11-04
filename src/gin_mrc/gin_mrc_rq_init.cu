@@ -16,20 +16,21 @@
 
 // One thread per peer QP performs the single-threaded RQ fill for its slot.
 __global__ static void ncclGinMrcInitRqKernel(struct doca_gpu_dev_verbs_qp* qps, struct ncclGinMrcRqState* rq,
-                                              int numQps, uint32_t* counterSlots, uint32_t counterCapacity) {
+                                              int numQps, uint32_t* counterSlots, uint32_t counterCapacity,
+                                              uint32_t postMode) {
   int peer = blockIdx.x * blockDim.x + threadIdx.x;
   if (peer < numQps) {
     uint32_t* slots = counterSlots ? counterSlots + (size_t)peer * counterCapacity : nullptr;
-    nccl::gin::mrc::rqInit(&qps[peer], &rq[peer], slots, counterCapacity);
+    nccl::gin::mrc::rqInit(&qps[peer], &rq[peer], slots, counterCapacity, postMode);
   }
 }
 
 extern "C" cudaError_t ncclGinMrcInitRqsLaunch(struct doca_gpu_dev_verbs_qp* qps, struct ncclGinMrcRqState* rq,
                                                int numQps, uint32_t* counterSlots, uint32_t counterCapacity,
-                                               cudaStream_t stream) {
+                                               uint32_t postMode, cudaStream_t stream) {
   if (numQps <= 0) return cudaSuccess;
   const int threads = 64;
   const int blocks = (numQps + threads - 1) / threads;
-  ncclGinMrcInitRqKernel<<<blocks, threads, 0, stream>>>(qps, rq, numQps, counterSlots, counterCapacity);
+  ncclGinMrcInitRqKernel<<<blocks, threads, 0, stream>>>(qps, rq, numQps, counterSlots, counterCapacity, postMode);
   return cudaGetLastError();
 }
