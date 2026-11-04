@@ -17,7 +17,7 @@
 
 // Bump whenever ncclGinMrcGPUContext / ncclGinMrcRqState change shape, together with
 // mrcBackendMinVersions[] in NCCL's src/gin/gin_host.cc.
-#define NCCL_GIN_MRC_VERSION 1
+#define NCCL_GIN_MRC_VERSION 2
 
 struct doca_gpu_dev_verbs_qp;
 
@@ -26,9 +26,11 @@ extern "C" {
 #endif
 
 // Pre-post every peer QP's receive ring. MRC signals arrive as Write-with-Immediate and
-// consume a receive WQE, so this must run before any peer issues an operation.
+// consume a receive WQE, so this must run before any peer issues an operation. postMode
+// (NCCL_GIN_MRC_RQ_POST_MODE_*) selects how the device posts and reposts receive WQEs.
 cudaError_t ncclGinMrcInitRqsLaunch(struct doca_gpu_dev_verbs_qp* qps, struct ncclGinMrcRqState* rq, int numQps,
-                                    uint32_t* counterSlots, uint32_t counterCapacity, cudaStream_t stream);
+                                    uint32_t* counterSlots, uint32_t counterCapacity, uint32_t postMode,
+                                    cudaStream_t stream);
 
 #ifdef __cplusplus
 }

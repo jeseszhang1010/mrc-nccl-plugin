@@ -63,6 +63,8 @@ NCCL_PARAM(GinMrcSl, "GIN_MRC_SL", -1);
 NCCL_PARAM(GinMrcTimeout, "IB_TIMEOUT", 20);
 NCCL_PARAM(GinMrcRetryCnt, "IB_RETRY_CNT", 7);
 NCCL_PARAM(GinMrcPkeyIndex, "IB_PKEY_INDEX", 0);
+// Receive WQE (re)post mode: 0 = lightweight DBR-only update, 1 = regular post-recv (see gin_mrc_dev.h).
+NCCL_PARAM(GinMrcRqPostMode, "GIN_MRC_RQ_POST_MODE", NCCL_GIN_MRC_RQ_POST_MODE_DBR);
 
 /* ── CUDA memory helpers ──────────────────────────────────────────── */
 
@@ -635,6 +637,16 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
                  ncclParamGinMrcTc() != -1                            ? (int)ncclParamGinMrcTc() :
                                                                         0;
   const int sl = ncclParamGinMrcSl() != -1 ? (int)ncclParamGinMrcSl() : 0;
+  const int64_t rqPostMode = ncclParamGinMrcRqPostMode();
+
+  if (rqPostMode != NCCL_GIN_MRC_RQ_POST_MODE_DBR && rqPostMode != NCCL_GIN_MRC_RQ_POST_MODE_WQE) {
+    WARN("GIN/MRC : invalid NCCL_GIN_MRC_RQ_POST_MODE=%ld (0 = DBR-only update, 1 = regular post-recv)",
+         (long)rqPostMode);
+    return ncclInvalidUsage;
+  }
+  INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : receive WQEs posted via %s (NCCL_GIN_MRC_RQ_POST_MODE=%ld)",
+       rqPostMode == NCCL_GIN_MRC_RQ_POST_MODE_WQE ? "regular post-recv" : "lightweight DBR update",
+       (long)rqPostMode);
 
   if (nCounters > 0 && nSignals == 0) {
     WARN("GIN/MRC : counters require a signal table to be present");
@@ -798,7 +810,7 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     uint32_t* slots =
       ctx->counterSlots ? ctx->counterSlots + (size_t)ctxIdx * nranks * ctx->counterCap : nullptr;
     cudaError_t cerr = ncclGinMrcInitRqsLaunch((struct doca_gpu_dev_verbs_qp*)gpuCtx->qps, gpuCtx->rq, nranks, slots,
-                                               ctx->counterCap, 0);
+                                               ctx->counterCap, (uint32_t)rqPostMode, 0);
     if (cerr != cudaSuccess) {
       WARN("GIN/MRC : receive-queue init kernel launch failed: %s", cudaGetErrorString(cerr));
       status = ncclUnhandledCudaError;

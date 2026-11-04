@@ -39,3 +39,11 @@ Each hint advertises `num_qps_per_peer` equal to the connection's negotiated QP 
 ## Speed scaling
 
 Since MRC-enabled VF is created from first PF, it inherits the speed of just the first PF. `NCCL_MRC_NUM_PLANES` scales the effective speed by the number of planes. Its default is 8.
+
+## GIN Plugin Parameters
+
+These apply to the GIN plugin (`libnccl-gin-mrc.so`).
+
+| Variable | Default | Range | Description |
+|---|---|---|---|
+| `NCCL_GIN_MRC_RQ_POST_MODE` | 0 | 0 or 1 | How the GPU posts and reposts receive WQEs for Write-with-Immediate signals. `0`: lightweight; the receive ring is filled once and each consumed slot is reposted by updating only the RQ doorbell record. `1`: regular post-recv (device-side equivalent of `mrc_post_recv`); each repost rewrites the WQE, marks it ready and submits it through the RQ doorbell path. Other values fail context creation. The selected mode is logged with `NCCL_DEBUG=INFO`. |
