@@ -47,3 +47,18 @@ These apply to the GIN plugin (`libnccl-gin-mrc.so`).
 | Variable | Default | Range | Description |
 |---|---|---|---|
 | `NCCL_GIN_MRC_RQ_POST_MODE` | 0 | 0 or 1 | How the GPU posts and reposts receive WQEs for Write-with-Immediate signals. `0`: lightweight; the receive ring is filled once and each consumed slot is reposted by updating only the RQ doorbell record. `1`: regular post-recv (device-side equivalent of `mrc_post_recv`); each repost rewrites the WQE, marks it ready and submits it through the RQ doorbell path. Other values fail context creation. The selected mode is logged with `NCCL_DEBUG=INFO`. |
+| `NCCL_GIN_MRC_GET_WINDOW` | 4 | power of two, 1–256 (≤ QP depth) | Maximum in-flight `get` requests per (GIN context, peer). Larger windows overlap more requests at the cost of receive-queue slots on both ends. Invalid values fail context creation. |
+
+### `get` over MRC (Receiver-Driven Write)
+
+MRC has no RDMA Read, so the GIN `get` operation is implemented with Receiver-Driven Write (RDW):
+
+1. The requester writes a 128 B descriptor (up to 4 sub-requests of at most 8 MiB each) into the data owner's request ring slot `requestId mod W` with an RDMA Write-with-Immediate. The immediate carries the request id and a generation tag.
+2. The data owner's GPU serves the request from its GIN receive drain. It validates the descriptor and checks that the source range lies inside a window registered on that rank. It then RDMA-writes the data back and finishes with a Write-with-Immediate response carrying the request id, generation and status (`OK`, `INVALID`, `BUSY` or `REJECTED`) on the same QP.
+3. MRC places those Writes before the response completes, so once the requester consumes the response the data is visible. `flush` and `flushAsync` + `wait` wait for every outstanding `get` response.
+
+Requests reuse the existing GIN QPs; no extra QPs or CPU threads are created. A `get` from the local rank is a local RDMA Write and needs no peer involvement.
+
+**Progress requirement:** a `get` request is served only while the data owner runs a kernel that drives GIN progress on the same context. Any signal/counter read or wait, `flush`, a `wait` on a request, or a GIN barrier does this. Keep peers in such a loop until all ranks' gets complete, for example by finishing with a GIN barrier after `flush`.
+
+**Errors:** a non-`OK` response is latched per peer. The timeout variants of `flush` and `wait` return `ncclRemoteError`; the non-timeout variants print the failure and trap. Recovering a failed QP by fencing and resetting it is not implemented yet.
