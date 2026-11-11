@@ -581,8 +581,9 @@ static ncclResult_t mrcGinGetProperties(int dev, ncclNetProperties_v12_t* props)
   NCCLCHECK(ncclIbGetProperties(dev, props));
 
   props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
-  props->railId = -1;
-  props->planeId = -1;
+  // Keep railId/planeId from NCCL_IB_HCA (<dev>:<port>:<rail>:<plane>): NCCL requires the NET and GIN
+  // plugins to agree for a device, and NCCL >= 2.32 orders each GPU's GIN connections by rail and
+  // plane, so on multi-plane fabrics they keep connection i of every rank on the same plane.
 
   props->netDeviceType = (ncclNetDeviceType)NCCL_NET_DEVICE_GIN_MRC;
   props->vProps.ndevs = 1;
