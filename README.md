@@ -69,3 +69,10 @@ export NCCL_GIN_PLUGIN=mrc
 Add `NCCL_GIN_TYPE=6` to force NCCL to use the MRC GIN backend rather than picking another
 available one. MRC GIN requires `NCCL_P2P_DISABLE=1`, since a GIN rank stride greater than one is
 not supported.
+
+GIN connection *i* of every rank must reach connection *i* of every peer. Starting with NCCL 2.32,
+NCCL orders each GPU's GIN devices by the rail and plane IDs the plugin reports, and both plugins take
+those IDs from `NCCL_IB_HCA` entries of the form `<dev>:<port>:<rail>:<plane>`. On fabrics where NICs
+sit on disjoint planes, give NICs that share a GPU group the same rail and give each NIC its plane, for
+example `NCCL_IB_HCA==mlx5_0:1:0:0,mlx5_1:1:0:1,mlx5_2:1:1:0,mlx5_3:1:1:1`. Without them, NCCL 2.32
+may pair NICs on different planes and QP setup fails with `failed to connect QP`.
