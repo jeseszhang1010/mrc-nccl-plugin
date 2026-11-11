@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 #include <infiniband/verbs.h>
 
+#include <atomic>
 #include <mutex>
 
 #include "transport/net_ib/common.h"
@@ -65,6 +66,11 @@ NCCL_PARAM(GinMrcRetryCnt, "IB_RETRY_CNT", 7);
 NCCL_PARAM(GinMrcPkeyIndex, "IB_PKEY_INDEX", 0);
 // Receive WQE (re)post mode: 0 = lightweight DBR-only update, 1 = regular post-recv (see gin_mrc_dev.h).
 NCCL_PARAM(GinMrcRqPostMode, "GIN_MRC_RQ_POST_MODE", NCCL_GIN_MRC_RQ_POST_MODE_DBR);
+// In-flight RDW get requests per (context, peer); a power of two.
+NCCL_PARAM(GinMrcGetWindow, "GIN_MRC_GET_WINDOW", 4);
+
+// Generation tag for RDW get requests, unique per created context set (6 bits on the wire).
+static std::atomic<uint32_t> mrcGinRdwGen{0};
 
 /* ── CUDA memory helpers ──────────────────────────────────────────── */
 
@@ -251,6 +257,9 @@ struct mrcGinCollComm {
   struct ncclSocket recvSock; // from rank-1
   struct ibv_context* context;
   struct ibv_pd* pd;
+  // This rank's registered windows, mirrored to the GPU so the RDW get server can validate a
+  // request's source and translate its rkey into an lkey. Allocated on first use.
+  MrcHostGpuBuf<struct ncclGinMrcMrTable> mrTable;
 };
 
 // ncclSocketAccept() memcpy's the listen socket, so the accepted socket inherits its async flag
@@ -353,8 +362,84 @@ struct mrcGinContext {
     struct ibv_mr* mr;
   } sink;
 
+  // RDW get: request rings, descriptor staging and response landing for every context
+  // (layout in gin_mrc_dev.h), one zero-based MR whose rkey is shared with every peer.
+  struct {
+    void* addr;
+    CUmemGenericAllocationHandle handle;
+    struct ibv_mr* mr;
+    size_t ctxStride;
+    uint32_t window;
+  } rdw;
+  MrcHostGpuBuf<uint32_t> rdwRkeys; // [nranks], big-endian
+
   ncclNetDeviceHandle_t* devHandle;
 };
+
+/* ── RDW get: registered-window table ─────────────────────────────── */
+
+// The GPU may be serving gets while windows are (de)registered, so the table is never compacted
+// or re-uploaded wholesale: a live entry is never moved, and each update is published by a final
+// aligned 4-byte copy (an entry's rkey, or the count) once everything it exposes is in place.
+// A removed entry is tombstoned with rkey 0 / size 0, which no lookup can match usefully.
+
+static ncclResult_t mrcGinMrTableEnsure(struct mrcGinCollComm* cComm) {
+  if (cComm->mrTable.gpu) return ncclSuccess;
+  NCCLCHECK(cComm->mrTable.allocate(1));
+  return cComm->mrTable.push();
+}
+
+static ncclResult_t mrcGinMrTableCopy(struct mrcGinCollComm* cComm, const void* hostField, size_t bytes) {
+  const size_t offset = (const char*)hostField - (const char*)cComm->mrTable.host;
+  CUDACHECK(cudaMemcpy((char*)cComm->mrTable.gpu + offset, hostField, bytes, cudaMemcpyHostToDevice));
+  return ncclSuccess;
+}
+
+static ncclResult_t mrcGinMrTableAdd(struct mrcGinCollComm* cComm, struct ibv_mr* mr, size_t size) {
+  NCCLCHECK(mrcGinMrTableEnsure(cComm));
+  struct ncclGinMrcMrTable* table = cComm->mrTable.host;
+  uint32_t slot = 0;
+  while (slot < table->count && table->entries[slot].rkey != 0) slot++;
+  if (slot == NCCL_GIN_MRC_MR_TABLE_CAPACITY) {
+    WARN("GIN/MRC : registered-window table is full (%d entries); gets from this window will be rejected",
+         NCCL_GIN_MRC_MR_TABLE_CAPACITY);
+    return ncclSuccess;
+  }
+  struct ncclGinMrcMrEntry* entry = &table->entries[slot];
+  entry->lkey = htobe32(mr->lkey);
+  entry->size = size;
+  if (slot < table->count) {
+    // Reusing a tombstone: lkey/size first, then the rkey that makes the entry matchable.
+    NCCLCHECK(mrcGinMrTableCopy(cComm, &entry->lkey, sizeof(entry->lkey)));
+    NCCLCHECK(mrcGinMrTableCopy(cComm, &entry->size, sizeof(entry->size)));
+    entry->rkey = htobe32(mr->rkey);
+    NCCLCHECK(mrcGinMrTableCopy(cComm, &entry->rkey, sizeof(entry->rkey)));
+  } else {
+    // Appending: the whole entry first, then the count that makes it visible.
+    entry->rkey = htobe32(mr->rkey);
+    NCCLCHECK(mrcGinMrTableCopy(cComm, entry, sizeof(*entry)));
+    table->count++;
+    NCCLCHECK(mrcGinMrTableCopy(cComm, &table->count, sizeof(table->count)));
+  }
+  INFO(NCCL_NET, "GIN/MRC : window rkey 0x%x (%zu bytes) registered for RDW get serving", mr->rkey, size);
+  return ncclSuccess;
+}
+
+static ncclResult_t mrcGinMrTableRemove(struct mrcGinCollComm* cComm, struct ibv_mr* mr) {
+  struct ncclGinMrcMrTable* table = cComm->mrTable.host;
+  if (table == nullptr) return ncclSuccess;
+  const uint32_t rkey = htobe32(mr->rkey);
+  for (uint32_t i = 0; i < table->count; i++) {
+    struct ncclGinMrcMrEntry* entry = &table->entries[i];
+    if (entry->rkey != rkey) continue;
+    entry->rkey = 0;
+    NCCLCHECK(mrcGinMrTableCopy(cComm, &entry->rkey, sizeof(entry->rkey)));
+    entry->size = 0;
+    NCCLCHECK(mrcGinMrTableCopy(cComm, &entry->size, sizeof(entry->size)));
+    return ncclSuccess;
+  }
+  return ncclSuccess;
+}
 
 /* ── QP setup ─────────────────────────────────────────────────────── */
 
@@ -595,6 +680,7 @@ static ncclResult_t mrcGinCloseColl(void* collComm) {
 
   NCCLCHECK(ncclSocketClose(&cComm->sendSock, false));
   NCCLCHECK(ncclSocketClose(&cComm->recvSock, false));
+  NCCLCHECK(cComm->mrTable.free_());
   free(cComm);
   return ncclSuccess;
 }
@@ -647,6 +733,12 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
   INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : receive WQEs posted via %s (NCCL_GIN_MRC_RQ_POST_MODE=%ld)",
        rqPostMode == NCCL_GIN_MRC_RQ_POST_MODE_WQE ? "regular post-recv" : "lightweight DBR update",
        (long)rqPostMode);
+  const int64_t getWindow = ncclParamGinMrcGetWindow();
+  uint32_t rdwGen;
+  if (getWindow < 1 || getWindow > 256 || (getWindow & (getWindow - 1)) != 0) {
+    WARN("GIN/MRC : invalid NCCL_GIN_MRC_GET_WINDOW=%ld (must be a power of two in [1, 256])", (long)getWindow);
+    return ncclInvalidUsage;
+  }
 
   if (nCounters > 0 && nSignals == 0) {
     WARN("GIN/MRC : counters require a signal table to be present");
@@ -711,6 +803,12 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
   // MRC has no atomics: signals ride Write-with-Immediate, which needs a receive queue.
   ctx->qpSqSize = config->queueDepth > 0 ? config->queueDepth : (uint32_t)ncclParamGinMrcQpDepth();
   ctx->qpRqSize = ctx->qpSqSize;
+  // Each in-flight get consumes a receive WQE on both ends, on top of the signal traffic.
+  if ((uint32_t)getWindow > ctx->qpRqSize) {
+    WARN("GIN/MRC : NCCL_GIN_MRC_GET_WINDOW=%ld exceeds the QP depth %u", (long)getWindow, ctx->qpRqSize);
+    status = ncclInvalidUsage;
+    goto out;
+  }
 
   memset(&qpInitAttr, 0, sizeof(qpInitAttr));
   qpInitAttr.gpu_dev = ctx->gdev;
@@ -764,6 +862,24 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ),
                 status, out);
 
+  // RDW get buffer: every rank uses the same layout, so a context's region sits at the same
+  // offset of every peer's zero-based RDW MR.
+  ctx->rdw.window = (uint32_t)getWindow;
+  ctx->rdw.ctxStride =
+    2 * (size_t)nranks * ctx->rdw.window * NCCL_GIN_MRC_RDW_DESC_BYTES + NCCL_GIN_MRC_RDW_DESC_BYTES;
+  NCCLCHECKGOTO(mrcCuMemAlloc(&ctx->rdw.addr, &ctx->rdw.handle, (size_t)ncontexts * ctx->rdw.ctxStride), status, out);
+  NCCLCHECKGOTO(mrcRegMr(&ctx->rdw.mr, cComm->pd, ctx->rdw.addr, (size_t)ncontexts * ctx->rdw.ctxStride,
+                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE, /*forceStrictOrdering=*/true),
+                status, out);
+  {
+    uint32_t rdwRkey = htobe32(ctx->rdw.mr->rkey);
+    NCCLCHECKGOTO(ctx->rdwRkeys.allocate(nranks), status, out);
+    NCCLCHECKGOTO(mrcGinAllGather(cComm, &rdwRkey, ctx->rdwRkeys.host, sizeof(uint32_t)), status, out);
+    NCCLCHECKGOTO(ctx->rdwRkeys.push(), status, out);
+  }
+  NCCLCHECKGOTO(mrcGinMrTableEnsure(cComm), status, out);
+  rdwGen = mrcGinRdwGen.fetch_add(1) & NCCL_GIN_MRC_RDW_GEN_MASK;
+
   CUDACHECKGOTO(cudaMalloc(&ctx->rq, (size_t)ncontexts * nranks * sizeof(struct ncclGinMrcRqState)), status, out);
   CUDACHECKGOTO(cudaMemset(ctx->rq, 0, (size_t)ncontexts * nranks * sizeof(struct ncclGinMrcRqState)), status, out);
   if (nCounters > 0) {
@@ -800,6 +916,13 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     }
     gpuCtx->rq = ctx->rq + (size_t)ctxIdx * nranks;
     gpuCtx->sink_lkey = htobe32(ctx->sink.mr->lkey);
+    gpuCtx->mr_table = cComm->mrTable.gpu;
+    gpuCtx->rdw_region = (uint8_t*)ctx->rdw.addr + (size_t)ctxIdx * ctx->rdw.ctxStride;
+    gpuCtx->rdw_rkeys = ctx->rdwRkeys.gpu;
+    gpuCtx->rdw_ctx_offset = (uint64_t)ctxIdx * ctx->rdw.ctxStride;
+    gpuCtx->rdw_lkey = htobe32(ctx->rdw.mr->lkey);
+    gpuCtx->rdw_window = ctx->rdw.window;
+    gpuCtx->rdw_gen = rdwGen;
 
     ctx->ctxBuf.host[ctxIdx] = *gpuCtx;
   }
@@ -828,8 +951,8 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
   *outDevHandle = devHandle;
   *outGinCtx = ctx;
 
-  INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : rank %d created %d contexts over %d ranks on %s", rank, ncontexts, nranks,
-       ctx->ibDevName);
+  INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : rank %d created %d contexts over %d ranks on %s (RDW get window %u)", rank,
+       ncontexts, nranks, ctx->ibDevName, ctx->rdw.window);
 
 out:
   free(localInfo);
@@ -885,6 +1008,10 @@ static ncclResult_t mrcGinDestroyContext(void* ginCtx) {
   if (ctx->sink.mr) wrap_ibv_dereg_mr(ctx->sink.mr);
   if (ctx->sink.addr) mrcCuMemFree(ctx->sink.addr);
 
+  if (ctx->rdw.mr) wrap_ibv_dereg_mr(ctx->rdw.mr);
+  if (ctx->rdw.addr) mrcCuMemFree(ctx->rdw.addr);
+  ctx->rdwRkeys.free_();
+
   if (ctx->ah) doca_verbs_ah_attr_destroy(ctx->ah);
   if (ctx->verbsContext) doca_verbs_context_destroy(ctx->verbsContext);
   if (ctx->gdev) doca_gpu_destroy(ctx->gdev);
@@ -915,6 +1042,7 @@ static ncclResult_t mrcGinRegMrSym(void* collComm, void* data, size_t size, int 
   mh->devHandle.host->rkeys = mh->rkeys.gpu;
   mh->devHandle.host->lkey = htobe32(mh->mr->lkey);
   NCCLCHECKGOTO(mh->devHandle.push(), status, fail);
+  NCCLCHECKGOTO(mrcGinMrTableAdd(cComm, mh->mr, size), status, fail);
 
   mh->type = type;
   *mhandle = mh;
@@ -938,9 +1066,9 @@ static ncclResult_t mrcGinRegMrSymDmaBuf(void* collComm, void* data, size_t size
 
 static ncclResult_t mrcGinDeregMrSym(void* collComm, void* mhandle) {
   struct mrcGinMemHandle* mh = (struct mrcGinMemHandle*)mhandle;
-  (void)collComm;
   if (mh == nullptr) return ncclSuccess;
 
+  NCCLCHECK(mrcGinMrTableRemove((struct mrcGinCollComm*)collComm, mh->mr));
   NCCLCHECK(wrap_ibv_dereg_mr(mh->mr));
   NCCLCHECK(mh->rkeys.free_());
   NCCLCHECK(mh->devHandle.free_());
