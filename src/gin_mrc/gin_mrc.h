@@ -17,7 +17,7 @@
 
 // Bump whenever ncclGinMrcGPUContext / ncclGinMrcRqState change shape, together with
 // mrcBackendMinVersions[] in NCCL's src/gin/gin_host.cc.
-#define NCCL_GIN_MRC_VERSION 3
+#define NCCL_GIN_MRC_VERSION 4
 
 struct doca_gpu_dev_verbs_qp;
 

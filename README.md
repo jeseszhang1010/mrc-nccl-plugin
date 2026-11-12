@@ -76,3 +76,9 @@ those IDs from `NCCL_IB_HCA` entries of the form `<dev>:<port>:<rail>:<plane>`. 
 sit on disjoint planes, give NICs that share a GPU group the same rail and give each NIC its plane, for
 example `NCCL_IB_HCA==mlx5_0:1:0:0,mlx5_1:1:0:1,mlx5_2:1:1:0,mlx5_3:1:1:1`. Without them, NCCL 2.32
 may pair NICs on different planes and QP setup fails with `failed to connect QP`.
+
+Each GIN context needs one MRC QP per peer, so a device communicator uses about
+`ginContextCount / connections × (nRanks + 1)` QPs per rank on each NIC. MRC NICs cap the number of
+connected QPs, and every process on the NIC shares the cap: about 3K per NIC was observed on Pilot.
+When the cap is hit, the INIT->RTR transition fails with a firmware `BAD_PARAM_ERR` and the plugin logs
+`QP connect failed after N of M QPs`. In that case, request fewer GIN contexts.

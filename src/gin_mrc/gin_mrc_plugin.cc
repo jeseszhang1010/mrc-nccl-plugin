@@ -840,11 +840,22 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
                   out);
   }
 
-  for (int peer = 0; peer < nranks; peer++) {
-    if (peer == rank) continue;
-    for (int ctxIdx = 0; ctxIdx < ncontexts; ctxIdx++) {
-      NCCLCHECKGOTO(mrcGinConnectQp(ctx, ctx->qps[peer + ctxIdx * nranks], &remoteInfo[(size_t)ctxIdx * nranks + peer]),
-                    status, out);
+  {
+    int nConnected = 0;
+    for (int peer = 0; peer < nranks; peer++) {
+      if (peer == rank) continue;
+      for (int ctxIdx = 0; ctxIdx < ncontexts; ctxIdx++) {
+        status = mrcGinConnectQp(ctx, ctx->qps[peer + ctxIdx * nranks], &remoteInfo[(size_t)ctxIdx * nranks + peer]);
+        if (status != ncclSuccess) {
+          // The NIC caps connected MRC QPs (shared by every process on it, ~3K observed), and the
+          // firmware only reports a generic bad-parameter error when the cap is hit.
+          WARN("GIN/MRC : QP connect failed after %d of %d QPs (%d contexts x %d peers) on %s. If this NIC "
+               "ran out of MRC QPs, request fewer GIN contexts.",
+               nConnected, nqpsForComm - ncontexts, ncontexts, nranks - 1, ctx->ibDevName);
+          goto out;
+        }
+        nConnected++;
+      }
     }
   }
 
