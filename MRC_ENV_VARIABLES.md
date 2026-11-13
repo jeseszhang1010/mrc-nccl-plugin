@@ -48,6 +48,7 @@ These apply to the GIN plugin (`libnccl-gin-mrc.so`).
 |---|---|---|---|
 | `NCCL_GIN_MRC_RQ_POST_MODE` | 0 | 0 or 1 | How the GPU posts and reposts receive WQEs for Write-with-Immediate signals. `0`: lightweight; the receive ring is filled once and each consumed slot is reposted by updating only the RQ doorbell record. `1`: regular post-recv (device-side equivalent of `mrc_post_recv`); each repost rewrites the WQE, marks it ready and submits it through the RQ doorbell path. Other values fail context creation. The selected mode is logged with `NCCL_DEBUG=INFO`. |
 | `NCCL_GIN_MRC_GET_WINDOW` | 4 | power of two, 1–256 (≤ QP depth) | Maximum in-flight `get` requests per (GIN context, peer). Larger windows overlap more requests at the cost of receive-queue slots on both ends. Invalid values fail context creation. |
+| `NCCL_GIN_MRC_DATA_DIRECT` | 1 | 0 or 1 | Register GIN windows over a NIC's Data Direct PCIe link when the GPU sits behind it (they share a PCI domain); other GPUs keep the C2C path on that NIC. Because completions still reach GPU memory over C2C, the receive drain then flushes with a DUMP WQE before publishing signals and get completions. Independent of `NCCL_IB_DATA_DIRECT`, which also moves the NET plugin and NCCL's host RMA to Data Direct. With `NCCL_DEBUG=INFO`, the choice is logged per NIC as `Data Direct on` or `off`. |
 
 ### `get` over MRC (Receiver-Driven Write)
 

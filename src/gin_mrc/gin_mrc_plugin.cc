@@ -68,6 +68,9 @@ NCCL_PARAM(GinMrcPkeyIndex, "IB_PKEY_INDEX", 0);
 NCCL_PARAM(GinMrcRqPostMode, "GIN_MRC_RQ_POST_MODE", NCCL_GIN_MRC_RQ_POST_MODE_DBR);
 // In-flight RDW get requests per (context, peer); a power of two.
 NCCL_PARAM(GinMrcGetWindow, "GIN_MRC_GET_WINDOW", 4);
+// Register GIN windows over a NIC's Data Direct PCIe link when this GPU sits behind it. Independent
+// of NCCL_IB_DATA_DIRECT, which also moves the NET plugin and NCCL's host RMA to Data Direct.
+NCCL_PARAM(GinMrcDataDirect, "GIN_MRC_DATA_DIRECT", 1);
 
 // Generation tag for RDW get requests, unique per created context set (6 bits on the wire).
 static std::atomic<uint32_t> mrcGinRdwGen{0};
@@ -180,9 +183,25 @@ static ncclResult_t mrcRegMrDmaBuf(struct ibv_mr** mr, struct ibv_pd* pd, void* 
   return status;
 }
 
+// Data Direct registration: the NIC reaches the buffer over its direct PCIe link to the GPU
+// instead of through the CPU (C2C). Fails quietly so callers can fall back.
+static ncclResult_t mrcRegMrDataDirect(struct ibv_mr** mr, struct ibv_pd* pd, void* addr, size_t length, int access) {
+  int dmabufFd = -1;
+  size_t alignedSize = ROUNDUP(length, (size_t)sysconf(_SC_PAGESIZE));
+  if (cuMemGetHandleForAddressRange((void*)&dmabufFd, (CUdeviceptr)addr, alignedSize,
+                                    CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                                    CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE) != CUDA_SUCCESS)
+    return ncclSystemError;
+  *mr = wrap_direct_mlx5dv_reg_dmabuf_mr(pd, 0, alignedSize, 0, dmabufFd, access,
+                                         MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
+  close(dmabufFd);
+  return *mr ? ncclSuccess : ncclSystemError;
+}
+
 static ncclResult_t mrcRegMr(struct ibv_mr** mr, struct ibv_pd* pd, void* addr, size_t length, int access,
-                             bool forceStrictOrdering = false) {
+                             bool forceStrictOrdering = false, bool dataDirect = false) {
   if (!forceStrictOrdering && ncclIbRelaxedOrderingEnabled) access |= IBV_ACCESS_RELAXED_ORDERING;
+  if (dataDirect && mrcRegMrDataDirect(mr, pd, addr, length, access) == ncclSuccess) return ncclSuccess;
   if (mrcRegMrDmaBuf(mr, pd, addr, length, access) == ncclSuccess) return ncclSuccess;
   NCCLCHECK(wrap_ibv_reg_mr_iova2(mr, pd, addr, length, 0, access));
   return ncclSuccess;
@@ -260,6 +279,16 @@ struct mrcGinCollComm {
   // This rank's registered windows, mirrored to the GPU so the RDW get server can validate a
   // request's source and translate its rkey into an lkey. Allocated on first use.
   MrcHostGpuBuf<struct ncclGinMrcMrTable> mrTable;
+  // Data Direct (NCCL_GIN_MRC_DATA_DIRECT, on by default for capable NICs): windows are registered
+  // over the NIC's direct PCIe link, and this 8-byte buffer, registered the same way, is the
+  // target of the device-side flush that orders that data ahead of C2C-delivered CQEs. Only
+  // set when the flush buffer registered for Data Direct, so windows never use Data Direct
+  // without a working flush.
+  struct {
+    void* addr;
+    CUmemGenericAllocationHandle handle;
+    struct ibv_mr* mr;
+  } dd;
 };
 
 // ncclSocketAccept() memcpy's the listen socket, so the accepted socket inherits its async flag
@@ -577,8 +606,58 @@ static ncclResult_t mrcGinGetGinProperties(ncclGinProperties_v14_t* ginProps) {
   return ncclSuccess;
 }
 
+extern int64_t ncclParamIbMergeVfs();
+
+// With Data Direct, net_ib places a NIC at its data-direct PCIe function, which is local to one
+// GPU only. GIN needs every GPU of a NIC pair to use both NICs (one connection per plane), so the
+// GIN plugin reports the NIC's regular PCI path, normalized like net_ib does for other devices;
+// mrcGinConnect still uses Data Direct when the GPU sits behind the data-direct function.
+static const char* mrcGinTopoPciPath(int dev) {
+  static std::mutex mutex;
+  static char paths[MAX_IB_DEVS][PATH_MAX];
+  std::lock_guard<std::mutex> lock(mutex);
+  char* p = paths[dev];
+  if (p[0] == '\0') {
+    snprintf(p, PATH_MAX, "%s", ncclIbDevs[dev].fullPciPath);
+    size_t len = strlen(p);
+    if (len >= 4) {
+      p[len - 1] = '0';
+      if (ncclParamIbMergeVfs()) p[len - 3] = p[len - 4] = '0';
+    }
+  }
+  return p;
+}
+
+// Whether to use Data Direct for windows on dev: the NIC has a data-direct PCIe function and the
+// current GPU sits behind it (they share a PCI domain). Only that GPU reaches the NIC directly;
+// the other GPU of the pair keeps the C2C path on this NIC.
+static bool mrcGinUseDataDirect(int dev) {
+  struct ncclIbDev* ibDev = ncclIbDevs + dev;
+  if (!ncclParamGinMrcDataDirect() || ibDev->ibProvider != IB_PROVIDER_MLX5) return false;
+  char ddPath[PATH_MAX] = "/sys";
+  if (ibDev->capsProvider.mlx5.dataDirect) {
+    snprintf(ddPath, sizeof(ddPath), "%s", ibDev->pciPath);
+  } else if (wrap_mlx5dv_get_data_direct_sysfs_path(ibDev->context, ddPath + 4, sizeof(ddPath) - 4) != ncclSuccess) {
+    return false;
+  }
+  int cudaDev, domain;
+  if (cudaGetDevice(&cudaDev) != cudaSuccess ||
+      cudaDeviceGetAttribute(&domain, cudaDevAttrPciDomainId, cudaDev) != cudaSuccess)
+    return false;
+  char prefix[64];
+  snprintf(prefix, sizeof(prefix), "/sys/devices/pci%04x:", domain);
+  if (strncmp(ddPath, prefix, strlen(prefix)) != 0) {
+    INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : GPU is not behind the Data Direct function of %s; using the C2C path",
+         ibDev->devName);
+    return false;
+  }
+  return true;
+}
+
 static ncclResult_t mrcGinGetProperties(int dev, ncclNetProperties_v12_t* props) {
   NCCLCHECK(ncclIbGetProperties(dev, props));
+  if (ncclIbDevs[dev].capsProvider.mlx5.dataDirect && ncclIbDevs[dev].fullPciPath[0] != '\0')
+    props->pciPath = (char*)mrcGinTopoPciPath(dev);
 
   props->netDeviceVersion = NCCL_NET_DEVICE_INVALID_VERSION;
   // Keep railId/planeId from NCCL_IB_HCA (<dev>:<port>:<rail>:<plane>): NCCL requires the NET and GIN
@@ -655,6 +734,18 @@ static ncclResult_t mrcGinConnect(void* ctx, void* handles[], int nranks, int ra
   cComm->context = ibDev->context;
   cComm->pd = ibDev->pd;
 
+  if (mrcGinUseDataDirect(cComm->dev)) {
+    if (mrcCuMemAlloc(&cComm->dd.addr, &cComm->dd.handle, sizeof(uint64_t)) == ncclSuccess &&
+        mrcRegMrDataDirect(&cComm->dd.mr, cComm->pd, cComm->dd.addr, sizeof(uint64_t),
+                           IBV_ACCESS_LOCAL_WRITE) == ncclSuccess) {
+      INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : Data Direct enabled on %s", ibDev->devName);
+    } else {
+      INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : Data Direct registration failed on %s; using the C2C path",
+           ibDev->devName);
+      cComm->dd.mr = nullptr;
+    }
+  }
+
   *collComm = cComm;
   (void)ctx;
   return ncclSuccess;
@@ -682,6 +773,8 @@ static ncclResult_t mrcGinCloseColl(void* collComm) {
   NCCLCHECK(ncclSocketClose(&cComm->sendSock, false));
   NCCLCHECK(ncclSocketClose(&cComm->recvSock, false));
   NCCLCHECK(cComm->mrTable.free_());
+  if (cComm->dd.mr) NCCLCHECK(wrap_ibv_dereg_mr(cComm->dd.mr));
+  if (cComm->dd.addr) NCCLCHECK(mrcCuMemFree(cComm->dd.addr));
   free(cComm);
   return ncclSuccess;
 }
@@ -847,10 +940,12 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
       for (int ctxIdx = 0; ctxIdx < ncontexts; ctxIdx++) {
         status = mrcGinConnectQp(ctx, ctx->qps[peer + ctxIdx * nranks], &remoteInfo[(size_t)ctxIdx * nranks + peer]);
         if (status != ncclSuccess) {
-          // The NIC caps connected MRC QPs (shared by every process on it, ~3K observed), and the
-          // firmware only reports a generic bad-parameter error when the cap is hit.
-          WARN("GIN/MRC : QP connect failed after %d of %d QPs (%d contexts x %d peers) on %s. If this NIC "
-               "ran out of MRC QPs, request fewer GIN contexts.",
+          // The firmware reports a generic bad-parameter error both when the peer NIC is on another
+          // network plane and when this NIC hit its cap of connected MRC QPs (~3K, shared by every
+          // process on it).
+          WARN("GIN/MRC : QP connect failed after %d of %d QPs (%d contexts x %d peers) on %s. Check that "
+               "NCCL_IB_HCA rail/plane IDs pair NICs on the same plane; at 0 QPs that is the likely cause, "
+               "otherwise the NIC may have run out of MRC QPs (request fewer GIN contexts).",
                nConnected, nqpsForComm - ncontexts, ncontexts, nranks - 1, ctx->ibDevName);
           goto out;
         }
@@ -938,6 +1033,8 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     gpuCtx->rdw_lkey = htobe32(ctx->rdw.mr->lkey);
     gpuCtx->rdw_window = ctx->rdw.window;
     gpuCtx->rdw_gen = rdwGen;
+    gpuCtx->dd_flush = cComm->dd.mr != nullptr;
+    gpuCtx->dd_flush_lkey = cComm->dd.mr ? htobe32(cComm->dd.mr->lkey) : 0;
 
     ctx->ctxBuf.host[ctxIdx] = *gpuCtx;
   }
@@ -967,8 +1064,9 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
   *outDevHandle = devHandle;
   *outGinCtx = ctx;
 
-  INFO(NCCL_INIT | NCCL_NET, "GIN/MRC : rank %d created %d contexts over %d ranks on %s (RDW get window %u)", rank,
-       ncontexts, nranks, ctx->ibDevName, ctx->rdw.window);
+  INFO(NCCL_INIT | NCCL_NET,
+       "GIN/MRC : rank %d created %d contexts over %d ranks on %s (RDW get window %u, Data Direct %s)", rank,
+       ncontexts, nranks, ctx->ibDevName, ctx->rdw.window, cComm->dd.mr ? "on" : "off");
 
 out:
   free(localInfo);
@@ -1051,7 +1149,7 @@ static ncclResult_t mrcGinRegMrSym(void* collComm, void* data, size_t size, int 
 
   NCCLCHECKGOTO(mrcRegMr(&mh->mr, cComm->pd, data, size,
                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ,
-                         (mrFlags & NCCL_NET_MR_FLAG_FORCE_SO) != 0),
+                         (mrFlags & NCCL_NET_MR_FLAG_FORCE_SO) != 0, /*dataDirect=*/cComm->dd.mr != nullptr),
                 status, fail);
 
   rkey = htobe32(mh->mr->rkey);
