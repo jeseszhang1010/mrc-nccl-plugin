@@ -914,6 +914,9 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     DOCACHECKGOTO(doca_gpu_verbs_export_multi_qps_dev(ctx->gdev, gverbsQps, nranks,
                                                       (struct doca_gpu_dev_verbs_qp**)&gpuCtx->qps),
                   status, out);
+    DOCACHECKGOTO(doca_gpu_verbs_export_multi_qps_dev(ctx->gdev, &ctx->qps[nqpsForComm + ctxIdx]->qp_gverbs, 1,
+                                                      (struct doca_gpu_dev_verbs_qp**)&gpuCtx->self_rq_qp),
+                  status, out);
 
     if (nCounters) {
       NCCLCHECKGOTO(ctx->counters->take(nCounters, &start), status, out);
@@ -944,8 +947,9 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     struct ncclGinMrcGPUContext* gpuCtx = &ctx->ctxStaging[ctxIdx];
     uint32_t* slots =
       ctx->counterSlots ? ctx->counterSlots + (size_t)ctxIdx * nranks * ctx->counterCap : nullptr;
-    cudaError_t cerr = ncclGinMrcInitRqsLaunch((struct doca_gpu_dev_verbs_qp*)gpuCtx->qps, gpuCtx->rq, nranks, slots,
-                                               ctx->counterCap, (uint32_t)rqPostMode, 0);
+    cudaError_t cerr = ncclGinMrcInitRqsLaunch((struct doca_gpu_dev_verbs_qp*)gpuCtx->qps,
+                                               (struct doca_gpu_dev_verbs_qp*)gpuCtx->self_rq_qp, rank, gpuCtx->rq,
+                                               nranks, slots, ctx->counterCap, (uint32_t)rqPostMode, 0);
     if (cerr != cudaSuccess) {
       WARN("GIN/MRC : receive-queue init kernel launch failed: %s", cudaGetErrorString(cerr));
       status = ncclUnhandledCudaError;
@@ -992,6 +996,11 @@ static ncclResult_t mrcGinDestroyContext(void* ginCtx) {
       for (int peer = 0; peer < nranks; peer++) gverbsQps[peer] = ctx->qps[ctxIdx * nranks + peer]->qp_gverbs;
       doca_gpu_verbs_unexport_multi_qps_dev(ctx->gdev, gverbsQps, nranks, (struct doca_gpu_dev_verbs_qp*)gpuCtx->qps);
       gpuCtx->qps = nullptr;
+      if (gpuCtx->self_rq_qp) {
+        doca_gpu_verbs_unexport_multi_qps_dev(ctx->gdev, &ctx->qps[nqpsForComm + ctxIdx]->qp_gverbs, 1,
+                                              (struct doca_gpu_dev_verbs_qp*)gpuCtx->self_rq_qp);
+        gpuCtx->self_rq_qp = nullptr;
+      }
     }
     free(gverbsQps);
   }
