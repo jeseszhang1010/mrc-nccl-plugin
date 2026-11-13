@@ -81,4 +81,14 @@ Each GIN context needs one MRC QP per peer, so a device communicator uses about
 `ginContextCount / connections × (nRanks + 1)` QPs per rank on each NIC. MRC NICs cap the number of
 connected QPs, and every process on the NIC shares the cap: about 3K per NIC was observed on Pilot.
 When the cap is hit, the INIT->RTR transition fails with a firmware `BAD_PARAM_ERR` and the plugin logs
-`QP connect failed after N of M QPs`. In that case, request fewer GIN contexts.
+`QP connect failed after N of M QPs`. In that case, request fewer GIN contexts. A failure at 0 QPs
+usually means the peer NIC is on another plane.
+
+With Data Direct, a NIC is reachable over a direct PCIe link from one GPU only, so NCCL would give each
+GPU a single, GPU-specific NIC. On fabrics where the two NICs of a GPU pair sit on different planes,
+ranks would then be paired across planes. The GIN plugin therefore keeps reporting each NIC at its
+regular PCI location, so every GPU still uses one connection per plane. It enables Data Direct per
+connection, only on the NIC whose Data Direct function sits in front of the GPU
+(`NCCL_GIN_MRC_DATA_DIRECT`, on by default). `NCCL_IB_DATA_DIRECT=1` would also move the NET plugin
+and NCCL's host-RMA proxy to Data Direct, where they hit that plane mismatch, so keep it at 0 on such
+fabrics.
