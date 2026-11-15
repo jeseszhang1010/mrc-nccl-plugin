@@ -17,7 +17,10 @@ External NCCL plugins using MRC (Multi-Path Reliable Connection) as transport:
 * OFED
 * NCCL with NET v12 support (runtime)
 * A C++17 compiler, Make, and Python 3 (build)
-* DOCA (GPUNetIO + verbs), for the GIN plugin only
+* For the GIN plugin only: the open-source DOCA GPUNetIO library
+  ([NVIDIA-DOCA/gpunetio](https://github.com/NVIDIA-DOCA/gpunetio), branch `feature/export_sdk_qp` for
+  both receive-queue modes or `main` for the CPU-managed one only), the DOCA SDK (verbs, for the RCX QP
+  type) and GDRCopy
 
 ## Build
 
@@ -31,24 +34,74 @@ make MRC_HOME=/path/to/mrc CUDA_HOME=/path/to/cuda DEBUG=1
 
 To supply `nccl.h` from a custom NCCL installation, add `NCCL_HOME=/path/to/nccl/build` to the make command. `nccl.h` will be included from `$(NCCL_HOME)/include`.
 
-`make net` and `make gin` build a single plugin. The GIN plugin needs a CUDA architecture matching
-the target GPU; override `NVCC_GENCODE` if it is not GB200 (`sm_100`).
+`make net` and `make gin` build a single plugin. The GIN plugin compiles the open-source DOCA GPUNetIO
+sources from `DOCA_HOME` (default `../gpunetio-sdkqp`, a `feature/export_sdk_qp` checkout) into itself,
+and needs the `NCCL_HOME` of an NCCL built with GIN MRC. One plugin build serves NCCL builds of either
+receive-queue mode (below) when `DOCA_HOME` provides `doca_gpu_verbs_export_sdk_qp`; with `main` it
+supports the CPU-managed mode only:
+
+```bash
+make gin NCCL_HOME=/path/to/nccl/build DOCA_HOME=/path/to/gpunetio
+```
+
+`make gin-test` builds `gin_mrc_rcx_loopback`, a single-node check of the GIN data path: two RCX QPs of
+one NIC connected to each other, `doca_gpu_dev_verbs_put_immediate` from a kernel, and CPU signal
+delivery. It reports latency and message rate, with a plain-write ping-pong as reference. Run it with
+`DOCA_SDK_LIB_PATH` set, and add `-z` for Data Direct with a NIC whose Data Direct function sits in front
+of the GPU (`-d`, `-g`). Override `NVCC_GENCODE` if the GPU is not GB200 (`sm_100`).
 
 `libnccl-net-mrc.so` and `libnccl-gin-mrc.so` are generated after building, with `mrc` as the suffix
 of each plugin library.
 
 ### NCCL and application builds
 
-The device half of the MRC GIN backend lives in NCCL and is opt-in, because it vendors a newer DOCA
-device-header snapshot than the GDAKI backend and the two cannot coexist in one translation unit.
-Build NCCL, and any application using the device API, with:
+The device half of the MRC GIN backend lives in NCCL and is opt-in: build NCCL with `GIN_MRC=1`
+(`build-nccl-gin-mrc.sh` in the NCCL tree). `GIN_MRC_RQ` selects who manages the receive queues:
+
+* `GIN_MRC_RQ=cpu` (default): `doca_gpu_dev_verbs_put_immediate` and CPU-managed receive queues, with
+  the open-source GPUNetIO device headers from `DOCA_HOME` (`main` or `feature/export_sdk_qp`).
+* `GIN_MRC_RQ=gpu`: the GPU posts and drains the receive queues with the DOCA SDK device functions.
+  The plugin creates the QPs with the open-source library and hands them to the SDK device code with
+  `doca_gpu_verbs_export_sdk_qp`. NCCL takes the SDK device headers from the DOCA SDK install
+  (`DOCA_SDK_HOME`, default `/opt/mellanox/doca`) and installs them with its own headers.
+
+The two modes cannot coexist in one NCCL build: the open-source and SDK device headers share include
+guards and type names with different layouts, and the device code is inlined into every kernel using
+the device API. Build NCCL once per mode (for example with `BUILD_DIR=build-cpu` and `build-gpu`) and
+switch by pointing `LD_LIBRARY_PATH` and application builds at the matching install. NCCL reports the
+mode to the plugin as the backend version (7 for CPU, 8 for GPU RQ), and the plugin follows it per
+communicator.
+
+Build any application using the device API, including JIT-compiled kernels such as NCCL EP's
+(`NVCC_EXTRA_FLAGS`), with:
 
 ```bash
 -DNCCL_GIN_MRC_ENABLE=1
 ```
 
-This selects MRC and disables GDAKI. No DOCA include path or library is needed for either build --
-only the MRC GIN plugin links DOCA.
+This selects MRC and disables GDAKI. The receive-queue mode comes from the NCCL install
+(`nccl_device/gin/mrc/gin_mrc_config.h`), which also carries the headers either mode needs, so the
+application needs no DOCA include path or library beyond it.
+
+### Signals and receive queues
+
+MRC QPs have no atomics, so a signal travels as the immediate of an RDMA Write-with-Immediate.
+
+With `GIN_MRC_RQ=cpu`, a put with a signal is a single `doca_gpu_dev_verbs_put_immediate` whose
+immediate packs the signal id and value. A progress thread of the GIN plugin drains the receive queues
+with `doca_gpu_verbs_rq_progress` into one DOCA GPUNetIO signal map per GIN context, which adds each
+value to the GPU slot of its signal, and returns the receive credits. Device code only reads signal
+slots.
+
+With `GIN_MRC_RQ=gpu`, the signal immediate rides the last Write-with-Immediate of the put's data
+(8-byte writes to a sink carry signals without data and the further chunks of a large Add). The GPU drains the receive CQs whenever it reads or waits on a signal or counter,
+applies the signal operations and reposts the receive WQEs (`NCCL_GIN_MRC_RQ_POST_MODE`). No CPU thread
+is involved, but a signal is only applied while some kernel on the receiver drives GIN progress.
+
+In CPU RQ mode, the 15-bit signal id of the default immediate layout bounds a context to 32768 signals
+(NCCL signals plus 3 per rank for `get`). Larger devComms fail context creation; rebuild GPUNetIO, NCCL and the plugin
+with `-DDOCA_GPUNETIO_VERBS_SIGNAL_IMM_VAL_SHIFT=24` for 23-bit ids, at the cost of 8-bit signal values
+(a larger `ncclGin_SignalAdd` is split into more immediates).
 
 ## Run (NCCL)
 
