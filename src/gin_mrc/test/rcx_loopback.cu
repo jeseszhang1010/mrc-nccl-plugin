@@ -1,24 +1,22 @@
 /*************************************************************************
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Single-node loopback check of the MRC GIN data path on the open-source DOCA
- * GPUNetIO stack: two QPs of one NIC (RCX by default) connected to each other,
- * Write-with-Immediate posted from a CUDA kernel with
- * doca_gpu_dev_verbs_put_immediate(), and the receive queues drained on the
- * CPU by doca_gpu_verbs_rq_progress() into a signal map, as the GIN plugin
- * does for its loopback responder.
+ * Single-node loopback check of the MRC GIN CPU RQ data path: two QPs of one
+ * NIC (RCX by default) built on the DOCA SDK (mrc_qp) and connected to each
+ * other, Write-with-Immediate posted from a CUDA kernel with the open-source
+ * GPUNetIO doca_gpu_dev_verbs_put_immediate() that NCCL embeds, and the
+ * receive queues drained on the CPU into GPU signal slots (mrc_cpu_rq), as
+ * the GIN plugin does for its loopback responder.
  *
  * Checks that every signal is delivered and that each payload is visible
  * once its signal is, and reports the ping-pong latency (one way = half a
  * round trip, each half crossing a CPU delivery) and the streaming rate.
  *
- * RCX QPs are a DOCA SDK feature: run with DOCA_SDK_LIB_PATH set to the DOCA
- * SDK library directory.
- *
  * Usage: rcx_loopback [-d mlx5_0] [-g 0] [-x 3] [-t rcx|rc] [-n iters] [-s bytes] [-z]
  ************************************************************************/
 
 #include <endian.h>
+#include <errno.h>
 #include <getopt.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -36,7 +34,8 @@
 
 #include <doca_gpunetio_device.h>
 
-#include "../mrc_qp.h"
+#include "../mrc_cpu_rq.h"
+#include "rcx_loopback_host.h"
 
 #define CHECK(cond, ...)                                                                                              \
   do {                                                                                                                \
@@ -47,17 +46,18 @@
       exit(1);                                                                                                        \
     }                                                                                                                 \
   } while (0)
-#define DOCA_OK(call) CHECK((call) == DOCA_SUCCESS, "%s", #call)
+#define DOCA_OK(call) CHECK((call) == 0, "%s", #call)
 #define CUDA_OK(call) CHECK((call) == cudaSuccess, "%s", #call)
 
 enum : uint32_t { kSigAtB = 0, kSigAtA = 1, kNumSigs = 2 };
 
 struct Progress {
   std::atomic<bool> run{true};
-  struct doca_gpu_verbs_qp* qps[2];
-  struct doca_gpu_verbs_signal_map* map;
+  struct mrcCpuRq rqs[2];
+  struct mrcCpuRqSignals sigs;
   bool strongFence;
-  doca_error_t error = DOCA_SUCCESS;
+  std::atomic<int> error{0};
+  struct mrcCpuRqError errInfo;
   // Delivery statistics, reported per phase.
   uint64_t sweeps = 0, busySweeps = 0, progressNs = 0, commitNs = 0;
 };
@@ -73,18 +73,22 @@ static void* progressMain(void* arg) {
   while (p->run.load(std::memory_order_relaxed)) {
     bool any = false;
     const uint64_t t0 = hostNs();
-    for (auto* qp : p->qps) {
+    for (auto& rq : p->rqs) {
       bool progressed = false;
-      doca_error_t s = doca_gpu_verbs_rq_progress(qp, p->map, &progressed);
-      if (s != DOCA_SUCCESS && p->error == DOCA_SUCCESS) p->error = s;
+      struct mrcCpuRqError e;
+      int s = mrcCpuRqPoll(&rq, &p->sigs, &progressed, &e);
+      if (s != 0 && p->error == 0) {
+        p->errInfo = e;
+        p->error = s;
+      }
       any |= progressed;
     }
     p->sweeps++;
     if (any) {
       const uint64_t t1 = hostNs();
-      doca_gpu_verbs_rq_commit_fence(p->strongFence);
-      for (auto* qp : p->qps) doca_gpu_verbs_rq_commit_dbr(qp);
-      doca_gpu_verbs_rq_commit_fence(p->strongFence);
+      mrcCpuRqCommitFence(p->strongFence);
+      for (auto& rq : p->rqs) mrcCpuRqCommitDbr(&rq);
+      mrcCpuRqCommitFence(p->strongFence);
       p->busySweeps++;
       p->progressNs += t1 - t0;
       p->commitNs += hostNs() - t1;
@@ -203,44 +207,6 @@ static uint32_t regMr(struct ibv_pd* pd, void* ptr, size_t size, bool dataDirect
   return htobe32(mr->lkey);
 }
 
-static void connectQp(struct doca_gpu_verbs_qp_hl* qp, doca_verbs_ah_attr_t* ah, uint32_t remoteQpn, int rdAtom) {
-  doca_verbs_qp_attr_t* attr = nullptr;
-  DOCA_OK(doca_verbs_qp_attr_create(&attr));
-  DOCA_OK(doca_verbs_qp_attr_set_path_mtu(attr, DOCA_VERBS_MTU_SIZE_4K_BYTES));
-  DOCA_OK(doca_verbs_qp_attr_set_rq_psn(attr, 0));
-  DOCA_OK(doca_verbs_qp_attr_set_sq_psn(attr, 0));
-  DOCA_OK(doca_verbs_qp_attr_set_port_num(attr, 1));
-  DOCA_OK(doca_verbs_qp_attr_set_ack_timeout(attr, 20));
-  DOCA_OK(doca_verbs_qp_attr_set_retry_cnt(attr, 7));
-  DOCA_OK(doca_verbs_qp_attr_set_rnr_retry(attr, 7));
-  DOCA_OK(doca_verbs_qp_attr_set_min_rnr_timer(attr, 1));
-  DOCA_OK(doca_verbs_qp_attr_set_next_state(attr, DOCA_VERBS_QP_STATE_INIT));
-  DOCA_OK(doca_verbs_qp_attr_set_allow_remote_write(attr, 1));
-  DOCA_OK(doca_verbs_qp_attr_set_allow_remote_read(attr, 1));
-  DOCA_OK(doca_verbs_qp_attr_set_atomic_mode(attr, DOCA_VERBS_QP_ATOMIC_MODE_IB_SPEC));
-  DOCA_OK(doca_verbs_qp_attr_set_ah_attr(attr, ah));
-  DOCA_OK(doca_verbs_qp_attr_set_dest_qp_num(attr, remoteQpn));
-  DOCA_OK(doca_verbs_qp_attr_set_pkey_index(attr, 0));
-  DOCA_OK(doca_verbs_qp_attr_set_max_dest_rd_atomic(attr, rdAtom));
-  DOCA_OK(doca_verbs_qp_attr_set_max_rd_atomic(attr, rdAtom));
-  DOCA_OK(doca_verbs_qp_modify(qp->qp, attr,
-                               DOCA_VERBS_QP_ATTR_NEXT_STATE | DOCA_VERBS_QP_ATTR_ALLOW_REMOTE_WRITE |
-                                 DOCA_VERBS_QP_ATTR_ALLOW_REMOTE_READ | DOCA_VERBS_QP_ATTR_ATOMIC_MODE |
-                                 DOCA_VERBS_QP_ATTR_PKEY_INDEX | DOCA_VERBS_QP_ATTR_PORT_NUM));
-  DOCA_OK(doca_verbs_qp_attr_set_next_state(attr, DOCA_VERBS_QP_STATE_RTR));
-  DOCA_OK(doca_verbs_qp_modify(qp->qp, attr,
-                               DOCA_VERBS_QP_ATTR_NEXT_STATE | DOCA_VERBS_QP_ATTR_RQ_PSN |
-                                 DOCA_VERBS_QP_ATTR_DEST_QP_NUM | DOCA_VERBS_QP_ATTR_PATH_MTU |
-                                 DOCA_VERBS_QP_ATTR_AH_ATTR | DOCA_VERBS_QP_ATTR_MIN_RNR_TIMER |
-                                 DOCA_VERBS_QP_ATTR_MAX_DEST_RD_ATOMIC | DOCA_VERBS_QP_ATTR_ATOMIC_MODE));
-  DOCA_OK(doca_verbs_qp_attr_set_next_state(attr, DOCA_VERBS_QP_STATE_RTS));
-  DOCA_OK(doca_verbs_qp_modify(qp->qp, attr,
-                               DOCA_VERBS_QP_ATTR_NEXT_STATE | DOCA_VERBS_QP_ATTR_SQ_PSN |
-                                 DOCA_VERBS_QP_ATTR_ACK_TIMEOUT | DOCA_VERBS_QP_ATTR_RETRY_CNT |
-                                 DOCA_VERBS_QP_ATTR_RNR_RETRY | DOCA_VERBS_QP_ATTR_MAX_QP_RD_ATOMIC));
-  DOCA_OK(doca_verbs_qp_attr_destroy(attr));
-}
-
 // Waits for the kernel; on a hang or RQ error, reports both QPs' last error and fails.
 static void printStats(Progress* p, uint64_t signals) {
   printf("  delivery: %lu signals in %lu busy sweeps (%.1f/sweep) of %lu; per busy sweep %.0f ns poll+apply, %.0f ns "
@@ -251,21 +217,19 @@ static void printStats(Progress* p, uint64_t signals) {
   p->sweeps = p->busySweeps = p->progressNs = p->commitNs = 0;
 }
 
-static void waitKernel(Progress* prog, struct doca_gpu_verbs_qp* qpA, struct doca_gpu_verbs_qp* qpB, const char* what) {
+static void waitKernel(Progress* prog, const char* what) {
   for (int ms = 0; ms < 20000; ms++) {
     cudaError_t e = cudaStreamQuery(0);
-    if (e == cudaSuccess && prog->error == DOCA_SUCCESS) return;
-    if ((e != cudaErrorNotReady && e != cudaSuccess) || prog->error != DOCA_SUCCESS) break;
+    if (e == cudaSuccess && prog->error == 0) return;
+    if ((e != cudaErrorNotReady && e != cudaSuccess) || prog->error != 0) break;
     usleep(1000);
   }
-  struct doca_gpu_verbs_qp* qps[2] = {qpA, qpB};
-  for (int i = 0; i < 2; i++) {
-    struct doca_gpu_verbs_qp_error_info info = {};
-    doca_gpu_verbs_query_last_error(qps[i], &info);
-    fprintf(stderr, "QP %c: has_error %d syndrome 0x%x vendor 0x%x hw 0x%x type 0x%x wqe %d\n", 'A' + i,
-            info.has_error, info.syndrome, info.vendor_err_synd, info.hw_err_synd, info.hw_synd_type, info.wqe_counter);
-  }
-  CHECK(false, "%s did not complete (rq_progress status %d)", what, prog->error);
+  if (prog->error != 0)
+    fprintf(stderr, "receive queue failed: CQE opcode %u syndrome 0x%x vendor 0x%x hw 0x%x wqe %u\n",
+            prog->errInfo.opcode, prog->errInfo.syndrome, prog->errInfo.vendorSyndrome, prog->errInfo.hwSyndrome,
+            prog->errInfo.wqeCounter);
+  CHECK(false, "%s did not complete (receive status %d, %lu dropped signals)", what, prog->error.load(),
+        prog->sigs.dropped);
 }
 
 int main(int argc, char** argv) {
@@ -294,10 +258,6 @@ int main(int argc, char** argv) {
 
   CUDA_OK(cudaSetDevice(gpu));
   CUDA_OK(cudaFree(0));
-  char busId[32];
-  CUDA_OK(cudaDeviceGetPCIBusId(busId, sizeof(busId), gpu));
-  doca_gpu_t* gdev = nullptr;
-  DOCA_OK(doca_gpu_create(busId, &gdev));
 
   int ndev = 0;
   struct ibv_device** list = ibv_get_device_list(&ndev);
@@ -310,38 +270,26 @@ int main(int argc, char** argv) {
   struct ibv_device_attr devAttr;
   union ibv_gid gid;
   CHECK(pd && ibv_query_device(ctx, &devAttr) == 0 && ibv_query_gid(ctx, 1, gidIndex, &gid) == 0, "ibv query");
-  doca_dev_t* netDev = nullptr;
-  DOCA_OK(doca_verbs_dev_open(pd, &netDev));
 
   struct mrcQpAttr qa = {};
-  qa.gpu_dev = gdev;
-  qa.net_dev = netDev;
-  qa.qp_type = rcx ? MRC_QP_TYPE_RCX : DOCA_VERBS_QP_TYPE_RC;
+  struct lbHost* host = lbHostOpen(gpu, pd, gidIndex, &gid, &qa);
+  qa.rcx = rcx;
   qa.sq_nwqe = 256;
   qa.rq_nwqe = 1024;
-  qa.nic_handler = DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB;
-  qa.data_direct = dataDirect;
-  struct doca_gpu_verbs_qp_hl *qpA = nullptr, *qpB = nullptr;
+  qa.nic_handler = MRC_QP_NIC_HANDLER_GPU_SM_DB;
+  struct mrcQp *qpA = nullptr, *qpB = nullptr;
   DOCA_OK(mrcQpCreate(&qa, &qpA));
   DOCA_OK(mrcQpCreate(&qa, &qpB));
-  uint32_t qpnA = 0, qpnB = 0;
-  DOCA_OK(doca_verbs_qp_get_qpn(qpA->qp, &qpnA));
-  DOCA_OK(doca_verbs_qp_get_qpn(qpB->qp, &qpnB));
+  lbHostConnect(host, qpA, mrcQpNum(qpB), devAttr.max_qp_rd_atom);
+  lbHostConnect(host, qpB, mrcQpNum(qpA), devAttr.max_qp_rd_atom);
 
-  doca_verbs_ah_attr_t* ah = nullptr;
-  struct doca_verbs_gid vgid;
-  memcpy(vgid.raw, gid.raw, sizeof(gid.raw));
-  DOCA_OK(doca_verbs_ah_attr_create(netDev, &ah));
-  DOCA_OK(doca_verbs_ah_attr_set_addr_type(ah, DOCA_VERBS_ADDR_TYPE_IPv4));
-  DOCA_OK(doca_verbs_ah_attr_set_gid(ah, vgid));
-  DOCA_OK(doca_verbs_ah_attr_set_sgid_index(ah, gidIndex));
-  DOCA_OK(doca_verbs_ah_attr_set_hop_limit(ah, 255));
-  connectQp(qpA, ah, qpnB, devAttr.max_qp_rd_atom);
-  connectQp(qpB, ah, qpnA, devAttr.max_qp_rd_atom);
-
-  doca_gpu_dev_verbs_qp *dA = nullptr, *dB = nullptr;
-  DOCA_OK(doca_gpu_verbs_get_qp_dev(qpA->qp_gverbs, &dA));
-  DOCA_OK(doca_gpu_verbs_get_qp_dev(qpB->qp_gverbs, &dB));
+  // The open-source GPUNetIO device QPs over the send queues of the DOCA SDK QPs.
+  struct mrcQpDesc desc[2];
+  DOCA_OK(mrcQpDescribe(qpA, &desc[0]));
+  DOCA_OK(mrcQpDescribe(qpB, &desc[1]));
+  doca_gpu_dev_verbs_qp* devQps = nullptr;
+  CUDA_OK((cudaError_t)mrcCpuRqExportQps(desc, 2, (void**)&devQps));
+  doca_gpu_dev_verbs_qp *dA = devQps, *dB = devQps + 1;
 
   uint8_t *bufA, *bufB;
   CUDA_OK(cudaMalloc(&bufA, bufBytes));
@@ -350,17 +298,28 @@ int main(int argc, char** argv) {
   CUDA_OK(cudaMemset(bufB, 0xff, bufBytes));
   const uint32_t keyA = regMr(pd, bufA, bufBytes, dataDirect), keyB = regMr(pd, bufB, bufBytes, dataDirect);
 
-  // Signal slots are application GPU memory, written only by the CPU delivery path.
-  uint64_t* sigs;
-  CUDA_OK(cudaMalloc(&sigs, kNumSigs * sizeof(uint64_t)));
-  struct doca_gpu_verbs_signal_map* map = nullptr;
-  DOCA_OK(doca_gpu_verbs_signal_map_create(&map));
-  DOCA_OK(doca_gpu_verbs_signal_register_range(map, 0, kNumSigs - 1, sigs));
+  // Signal slots are application GPU memory, written only by the CPU delivery path through a
+  // GDRCopy mapping of their (64 KiB aligned) GPU page.
+  const size_t kPage = 1 << 16;
+  void* sigsAlloc;
+  CUDA_OK(cudaMalloc(&sigsAlloc, 2 * kPage));
+  uint64_t* sigs = (uint64_t*)(((uintptr_t)sigsAlloc + kPage - 1) & ~(uintptr_t)(kPage - 1));
+  CUDA_OK(cudaMemset(sigs, 0, kNumSigs * sizeof(uint64_t)));
+  struct mrcCpuRqMap* map = nullptr;
+  int mapErr = mrcCpuRqMapCreate(sigs, kPage, dataDirect, &map);
+  CHECK(mapErr == 0, "GDRCopy mapping of the signal slots failed (%d)%s", mapErr,
+        mapErr == -ENOTSUP ? ": no forced-PCIe support for Data Direct" : "");
+  uint64_t shadow[kNumSigs] = {};
 
   Progress prog;
-  prog.qps[0] = qpA->qp_gverbs;
-  prog.qps[1] = qpB->qp_gverbs;
-  prog.map = map;
+  mrcCpuRqInit(&prog.rqs[0], &desc[0]);
+  mrcCpuRqInit(&prog.rqs[1], &desc[1]);
+  memset(&prog.sigs, 0, sizeof(prog.sigs));
+  prog.sigs.slots = mrcCpuRqMapCpu(map, sigs);
+  prog.sigs.shadow = shadow;
+  prog.sigs.nIds = kNumSigs;
+  prog.sigs.skipId = UINT32_MAX;
+  prog.sigs.mcst = mrcCpuRqNeedsMcst(gpu);
   prog.strongFence = dataDirect;
   pthread_t thr;
   CHECK(pthread_create(&thr, nullptr, progressMain, &prog) == 0, "pthread_create");
@@ -370,7 +329,7 @@ int main(int argc, char** argv) {
   out[0] = out[1] = 0;
   const int warmup = iters / 10;
   pingPong<<<1, 1>>>(dA, dB, bufA, bufB, keyA, keyB, bytes, sigs + kSigAtB, sigs + kSigAtA, iters, warmup, out);
-  waitKernel(&prog, qpA->qp_gverbs, qpB->qp_gverbs, "ping-pong");
+  waitKernel(&prog, "ping-pong");
   CHECK(out[1] == 0, "a payload was not visible when its signal was");
   printf("%s%s ping-pong %zu B: %.2f us one-way over %d round trips\n", rcx ? "RCX" : "RC", dataDirect ? "+DD" : "",
          bytes, out[0] / 1e3 / iters / 2, iters);
@@ -380,7 +339,7 @@ int main(int argc, char** argv) {
   CUDA_OK(cudaMemset(bufA, 0, bufBytes));
   CUDA_OK(cudaMemset(bufB, 0, bufBytes));
   pingPongPolled<<<1, 1>>>(dA, dB, (uint64_t*)bufA, (uint64_t*)bufB, keyA, keyB, iters, warmup, out);
-  waitKernel(&prog, qpA->qp_gverbs, qpB->qp_gverbs, "polled ping-pong");
+  waitKernel(&prog, "polled ping-pong");
   printf("%s%s polled ping-pong 8 B (plain writes, no CPU): %.2f us one-way\n", rcx ? "RCX" : "RC",
          dataDirect ? "+DD" : "", out[0] / 1e3 / iters / 2);
 
@@ -391,23 +350,24 @@ int main(int argc, char** argv) {
 
   const int msgs = iters * 10;
   stream<<<1, threads>>>(dA, bufA, bufB, keyA, keyB, bytes, sigs + kSigAtB, hostSigs[kSigAtB], msgs, out);
-  waitKernel(&prog, qpA->qp_gverbs, qpB->qp_gverbs, "stream");
+  waitKernel(&prog, "stream");
   printf("%s%s stream %zu B x %d threads: %.2f Mmsg/s, %.2f GB/s\n", rcx ? "RCX" : "RC", dataDirect ? "+DD" : "",
          bytes, threads, msgs / (out[0] / 1e3), msgs * (double)bytes / out[0]);
   printStats(&prog, msgs);
 
   prog.run = false;
   pthread_join(thr, nullptr);
-  CHECK(prog.error == DOCA_SUCCESS, "rq_progress error %d", prog.error);
+  CHECK(prog.error == 0 && prog.sigs.dropped == 0, "receive error %d, %lu dropped signals", prog.error.load(),
+        prog.sigs.dropped);
   CUDA_OK(cudaMemcpy(hostSigs, sigs, sizeof(hostSigs), cudaMemcpyDeviceToHost));
   CHECK(hostSigs[kSigAtB] == (uint64_t)(iters + warmup + msgs), "stream signal total %lu, expected %d",
         hostSigs[kSigAtB], iters + warmup + msgs);
 
-  DOCA_OK(doca_gpu_verbs_signal_unregister_range(map, 0, kNumSigs - 1));
-  DOCA_OK(doca_gpu_verbs_signal_map_destroy(map));
-  doca_verbs_ah_attr_destroy(ah);
+  mrcCpuRqMapDestroy(map);
+  mrcCpuRqFreeQps(devQps);
   mrcQpDestroy(qpA);
   mrcQpDestroy(qpB);
+  lbHostClose(host);
   printf("PASSED\n");
   return 0;
 }

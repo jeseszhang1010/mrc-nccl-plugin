@@ -1,14 +1,14 @@
 /*************************************************************************
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * RCX queue-pair builder for the MRC GIN plugin (see mrc_qp.h). Mirrors the
- * open-source doca_gpu_verbs_create_qp_hl() resource layout, so the QP is
- * torn down by doca_gpu_verbs_destroy_qp_hl(), but sets the QP type, and can
- * keep the receive CQ in GPU memory.
+ * RCX queue-pair builder for the MRC GIN plugin on the DOCA SDK (see mrc_qp.h).
+ * Same resource layout as the DOCA GPUNetIO verbs samples (verbs_high_level.c):
+ * external UAR, work queues, doorbell record and CQs in caller-owned memory.
  ************************************************************************/
 
 #include "mrc_qp.h"
 
+#include <endian.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,14 +16,48 @@
 
 #include <cuda_runtime.h>
 
+#include <doca_dev.h>
+#include <doca_gpunetio.h>
+#include <doca_gpunetio_verbs_def.h>
+#include <doca_uar.h>
+#include <doca_umem.h>
+#include <doca_verbs.h>
+#include <doca_verbs_mp.h>
+
 #define MRC_QP_ERR(fmt, ...) fprintf(stderr, "[GIN/MRC QP] " fmt "\n", ##__VA_ARGS__)
 
-// Same as the open-source high-level layer (doca_gpunetio_high_level.cpp).
 static constexpr uint32_t kDbrSize = 8;
-static constexpr uint32_t kWqeBbSize = 64; // send WQE and WQE basic block
-static constexpr uint32_t kRcvWqeSize = 16; // one receive data segment
+static constexpr uint32_t kRcvWqeSize = sizeof(struct mlx5_wqe_data_seg);
+static constexpr uint32_t kSndWqeSize = sizeof(struct doca_gpu_dev_verbs_wqe);
 static constexpr uint32_t kMaxSegs = 1;
-static constexpr int kIbvAccessLocalWrite = 1; // IBV_ACCESS_LOCAL_WRITE
+static constexpr uint32_t kUmemAccess = DOCA_ACCESS_FLAG_LOCAL_READ_WRITE | DOCA_ACCESS_FLAG_RDMA_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_READ | DOCA_ACCESS_FLAG_RDMA_ATOMIC;
+
+struct mrcQp {
+  struct doca_gpu* gpu;
+  enum doca_gpu_dev_verbs_nic_handler nic;
+  struct doca_uar* uar;
+
+  struct doca_verbs_cq* cq_sq;
+  void* cq_sq_mem; // GPU
+  struct doca_umem* cq_sq_umem;
+
+  struct doca_verbs_cq* cq_rq;
+  void* cq_rq_mem; // GPU (GPU RQ) or host (CPU RQ)
+  bool cq_rq_host;
+  struct doca_umem* cq_rq_umem;
+
+  struct doca_verbs_qp* qp;
+  void* wq_mem; // GPU: receive ring, then send ring
+  struct doca_umem* wq_umem;
+  void* dbr_mem; // GPU
+  void* dbr_cpu; // CPU mapping of dbr_mem (CPU RQ)
+  struct doca_umem* dbr_umem;
+  uint32_t rq_wqe_num;
+
+  struct doca_gpu_verbs_qp* gverbs;
+  struct doca_gpu_dev_verbs_qp* dev; // GPU
+};
 
 static size_t pageSize() {
   long sz = sysconf(_SC_PAGESIZE);
@@ -38,225 +72,244 @@ static uint32_t nextPow2(uint32_t v) {
   return p;
 }
 
-// The high-level QP plus what doca_gpu_verbs_destroy_qp_hl() does not know about. hl comes first, so
-// that the library's free() of the high-level QP releases the whole allocation.
-struct mrcQpHl {
-  struct doca_gpu_verbs_qp_hl hl;
-  void* rq_cq_gpu_ptr; // GPU-memory receive CQ (rq_gpu), whose CQ object hl owns
-};
-
-static uint32_t cqUmemSize(uint32_t ncqes, uint32_t dbrSize) {
-  return alignUp(ncqes * (uint32_t)sizeof(struct doca_gpunetio_ib_mlx5_cqe64) + dbrSize, (uint32_t)pageSize());
+static uint32_t cqUmemSize(uint32_t ncqes) {
+  return alignUp(ncqes * (uint32_t)sizeof(struct mlx5_cqe64) + kDbrSize, (uint32_t)pageSize());
 }
 
-static void initCqes(struct doca_gpunetio_ib_mlx5_cqe64* cqes, uint32_t n) {
+static void initCqes(struct mlx5_cqe64* cqes, uint32_t n) {
   for (uint32_t i = 0; i < n; i++)
-    cqes[i].op_own = (DOCA_GPUNETIO_IB_MLX5_CQE_INVALID << DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT) |
-                     DOCA_GPUNETIO_IB_MLX5_CQE_OWNER_MASK;
+    cqes[i].op_own = (MLX5_CQE_INVALID << DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT) | MLX5_CQE_OWNER_MASK;
 }
 
-// Register GPU memory with the NIC, preferring DMA-BUF over nvidia-peermem.
-static doca_error_t gpuUmem(doca_gpu_t* gpu, doca_dev_t* dev, void* ptr, size_t size, doca_verbs_umem_t** umem) {
-  int fd = (int)DOCA_VERBS_DMABUF_INVALID_FD;
-  if (doca_gpu_get_dmabuf_fd(gpu, ptr, size, &fd) != DOCA_SUCCESS) fd = (int)DOCA_VERBS_DMABUF_INVALID_FD;
-  doca_error_t status = doca_verbs_umem_create(dev, gpu, ptr, size, kIbvAccessLocalWrite, fd, 0, umem);
-  if (status != DOCA_SUCCESS && fd != (int)DOCA_VERBS_DMABUF_INVALID_FD)
-    status = doca_verbs_umem_create(dev, gpu, ptr, size, kIbvAccessLocalWrite, DOCA_VERBS_DMABUF_INVALID_FD, 0, umem);
-  if (fd != (int)DOCA_VERBS_DMABUF_INVALID_FD) close(fd);
-  return status;
+static doca_error_t createUar(struct mrcQp* q, struct doca_dev* dev) {
+  if (q->nic != DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF) {
+    if (doca_uar_create(dev, DOCA_UAR_ALLOCATION_TYPE_NONCACHE_DEDICATED, &q->uar) == DOCA_SUCCESS)
+      return DOCA_SUCCESS;
+    if (doca_uar_create(dev, DOCA_UAR_ALLOCATION_TYPE_NONCACHE, &q->uar) == DOCA_SUCCESS) return DOCA_SUCCESS;
+  }
+  return doca_uar_create(dev, DOCA_UAR_ALLOCATION_TYPE_BLUEFLAME, &q->uar);
 }
 
-// CQ with CQEs and doorbell record in GPU memory, polled by device code.
-static doca_error_t createGpuCq(doca_gpu_t* gpu, doca_dev_t* dev, uint32_t ncqes, void** gpuPtr,
-                                doca_verbs_umem_t** umem, doca_verbs_cq_t** cq) {
-  const uint32_t size = cqUmemSize(ncqes, kDbrSize);
-  doca_verbs_cq_attr_t* attr = nullptr;
-  struct doca_gpunetio_ib_mlx5_cqe64* ring = nullptr;
-  doca_error_t status = doca_gpu_mem_alloc(gpu, size, pageSize(), DOCA_GPU_MEM_TYPE_GPU, gpuPtr, nullptr);
+// CQ over caller memory: GPU memory polled by device code, or host memory polled by the CPU.
+static doca_error_t createCq(struct mrcQp* q, const struct mrcQpAttr* a, uint32_t ncqes, bool host, void** mem,
+                             struct doca_umem** umem, struct doca_verbs_cq** cq) {
+  const uint32_t size = cqUmemSize(ncqes);
+  struct doca_verbs_cq_attr* attr = nullptr;
+  doca_error_t status;
+
+  if (host) {
+    if (posix_memalign(mem, pageSize(), size) != 0) {
+      *mem = nullptr;
+      return DOCA_ERROR_NO_MEMORY;
+    }
+    memset(*mem, 0, size);
+    initCqes((struct mlx5_cqe64*)*mem, ncqes);
+    status = doca_umem_create(a->dev, *mem, size, kUmemAccess, umem);
+  } else {
+    status = doca_gpu_mem_alloc(q->gpu, size, pageSize(), DOCA_GPU_MEM_TYPE_GPU, mem, nullptr);
+    if (status != DOCA_SUCCESS) return status;
+    struct mlx5_cqe64* ring = (struct mlx5_cqe64*)calloc(1, size);
+    if (ring == nullptr) return DOCA_ERROR_NO_MEMORY;
+    initCqes(ring, ncqes);
+    if (cudaMemcpy(*mem, ring, size, cudaMemcpyHostToDevice) != cudaSuccess) status = DOCA_ERROR_DRIVER;
+    free(ring);
+    if (status != DOCA_SUCCESS) return status;
+    status = doca_umem_gpu_create(q->gpu, a->dev, *mem, size, kUmemAccess, umem);
+  }
   if (status != DOCA_SUCCESS) return status;
 
-  ring = (struct doca_gpunetio_ib_mlx5_cqe64*)calloc(1, size);
-  if (ring == nullptr) return DOCA_ERROR_NO_MEMORY;
-  initCqes(ring, ncqes);
-  if (cudaMemcpy(*gpuPtr, ring, size, cudaMemcpyDefault) != cudaSuccess) status = DOCA_ERROR_DRIVER;
-  free(ring);
-  if (status != DOCA_SUCCESS) return status;
-
-  status = gpuUmem(gpu, dev, *gpuPtr, size, umem);
-  if (status != DOCA_SUCCESS) return status;
-
-  status = doca_verbs_cq_attr_create(&attr);
-  if (status != DOCA_SUCCESS) return status;
-  if ((status = doca_verbs_cq_attr_set_external_umem(attr, *umem, 0)) != DOCA_SUCCESS ||
+  if ((status = doca_verbs_cq_attr_create(&attr)) != DOCA_SUCCESS) return status;
+  if ((status = doca_verbs_cq_attr_set_external_datapath_en(attr, 1)) != DOCA_SUCCESS ||
+      (status = doca_verbs_cq_attr_set_external_umem(attr, *umem, 0)) != DOCA_SUCCESS ||
       (status = doca_verbs_cq_attr_set_cq_size(attr, ncqes)) != DOCA_SUCCESS ||
-      (status = doca_verbs_cq_attr_set_cq_overrun(attr, DOCA_VERBS_CQ_ENABLE_OVERRUN)) != DOCA_SUCCESS ||
-      (status = doca_verbs_cq_create(dev, attr, cq)) != DOCA_SUCCESS) {
+      (status = doca_verbs_cq_attr_set_cq_overrun(attr, 1)) != DOCA_SUCCESS ||
+      (status = doca_verbs_cq_attr_set_external_uar(attr, q->uar)) != DOCA_SUCCESS ||
+      (status = doca_verbs_cq_create(a->verbs_ctx, attr, cq)) != DOCA_SUCCESS) {
     doca_verbs_cq_attr_destroy(attr);
     return status;
   }
   return doca_verbs_cq_attr_destroy(attr);
 }
 
-// Receive CQ: CQEs and doorbell record in host memory, polled by doca_gpu_verbs_rq_progress().
-static doca_error_t createRqCq(struct doca_gpu_verbs_qp_hl* qp, doca_dev_t* dev, uint32_t ncqes) {
-  const uint32_t size = cqUmemSize(ncqes, kDbrSize);
-  doca_verbs_cq_attr_t* attr = nullptr;
-  void* buf = nullptr;
-  uint32_t n = 0;
-  uint8_t esz = 0;
-  doca_error_t status;
-
-  if (posix_memalign(&qp->cq_rq_umem_cpu_ptr, pageSize(), size) != 0) {
-    qp->cq_rq_umem_cpu_ptr = nullptr;
-    return DOCA_ERROR_NO_MEMORY;
-  }
-  memset(qp->cq_rq_umem_cpu_ptr, 0, size);
-  initCqes((struct doca_gpunetio_ib_mlx5_cqe64*)qp->cq_rq_umem_cpu_ptr, ncqes);
-
-  status = doca_verbs_umem_create(dev, qp->gpu_dev, qp->cq_rq_umem_cpu_ptr, size, kIbvAccessLocalWrite,
-                                  DOCA_VERBS_DMABUF_INVALID_FD, 0, &qp->cq_rq_umem);
-  if (status != DOCA_SUCCESS) return status;
-
-  status = doca_verbs_cq_attr_create(&attr);
-  if (status != DOCA_SUCCESS) return status;
-  if ((status = doca_verbs_cq_attr_set_external_umem(attr, qp->cq_rq_umem, 0)) != DOCA_SUCCESS ||
-      (status = doca_verbs_cq_attr_set_cq_size(attr, ncqes)) != DOCA_SUCCESS ||
-      (status = doca_verbs_cq_attr_set_cq_overrun(attr, DOCA_VERBS_CQ_ENABLE_OVERRUN)) != DOCA_SUCCESS ||
-      (status = doca_verbs_cq_create(dev, attr, &qp->cq_rq)) != DOCA_SUCCESS) {
-    doca_verbs_cq_attr_destroy(attr);
-    return status;
-  }
-  doca_verbs_cq_attr_destroy(attr);
-
-  // rq_progress walks the ring through this address, so it must be the buffer just registered.
-  status = doca_verbs_cq_get_wq(qp->cq_rq, &buf, &n, &esz);
-  if (status != DOCA_SUCCESS) return status;
-  if (buf != qp->cq_rq_umem_cpu_ptr || n != ncqes || esz != sizeof(struct doca_gpunetio_ib_mlx5_cqe64)) {
-    MRC_QP_ERR("receive CQ has unexpected ring properties (buf %p/%p, %u/%u CQEs, %u B)", buf,
-               qp->cq_rq_umem_cpu_ptr, n, ncqes, esz);
-    return DOCA_ERROR_INVALID_VALUE;
-  }
-  return DOCA_SUCCESS;
-}
-
-static doca_error_t createUar(struct doca_gpu_verbs_qp_hl* qp, doca_dev_t* dev,
-                              enum doca_gpu_dev_verbs_nic_handler nicHandler) {
-  if (nicHandler != DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF) {
-    if (doca_verbs_uar_create(dev, DOCA_VERBS_UAR_ALLOCATION_TYPE_NONCACHE_DEDICATED, &qp->external_uar) ==
-        DOCA_SUCCESS)
-      return DOCA_SUCCESS;
-    return doca_verbs_uar_create(dev, DOCA_VERBS_UAR_ALLOCATION_TYPE_NONCACHE, &qp->external_uar);
-  }
-  return doca_verbs_uar_create(dev, DOCA_VERBS_UAR_ALLOCATION_TYPE_BLUEFLAME, &qp->external_uar);
-}
-
-// Work queues in GPU memory. With a CPU-managed receive queue the doorbell record is GDRCopy-mapped
-// GPU memory: the NIC and the GPU use its GPU address and the CPU returns receive credits through
-// the mapping.
-static doca_error_t createQp(struct doca_gpu_verbs_qp_hl* qp, const struct mrcQpAttr* a, uint32_t sqN, uint32_t rqN,
-                             void** dbrCpuPtr) {
-  const uint32_t wqSize = alignUp(sqN * kWqeBbSize + alignUp(rqN * kRcvWqeSize, kWqeBbSize), (uint32_t)pageSize());
+// Work queues and doorbell record in GPU memory. With a CPU-managed receive queue the doorbell
+// record is GDRCopy-mapped: the NIC and the GPU use its GPU address, and the CPU returns receive
+// credits through the mapping.
+static doca_error_t createQp(struct mrcQp* q, const struct mrcQpAttr* a, uint32_t sqN, uint32_t rqN) {
+  const uint32_t wqSize = alignUp(alignUp(rqN * kRcvWqeSize, kSndWqeSize) + sqN * kSndWqeSize, (uint32_t)pageSize());
   const uint32_t dbrSize = alignUp(kDbrSize, (uint32_t)pageSize());
-  doca_verbs_qp_init_attr_t* attr = nullptr;
+  const bool cpuRq = rqN > 0 && !a->rq_gpu;
+  struct doca_verbs_qp_init_attr* attr = nullptr;
   doca_error_t status;
 
-  *dbrCpuPtr = nullptr;
-  status = doca_gpu_mem_alloc(qp->gpu_dev, wqSize, pageSize(), DOCA_GPU_MEM_TYPE_GPU, &qp->qp_umem_gpu_ptr, nullptr);
+  status = doca_gpu_mem_alloc(q->gpu, wqSize, pageSize(), DOCA_GPU_MEM_TYPE_GPU, &q->wq_mem, nullptr);
   if (status != DOCA_SUCCESS) return status;
-  status = gpuUmem(qp->gpu_dev, a->net_dev, qp->qp_umem_gpu_ptr, wqSize, &qp->qp_umem);
-  if (status != DOCA_SUCCESS) return status;
-
-  const bool cpuRq = rqN > 0 && !a->rq_gpu;
-  status = doca_gpu_mem_alloc(qp->gpu_dev, dbrSize, pageSize(), cpuRq ? DOCA_GPU_MEM_TYPE_GPU_CPU : DOCA_GPU_MEM_TYPE_GPU,
-                              &qp->qp_umem_dbr_gpu_ptr, cpuRq ? dbrCpuPtr : nullptr);
-  if (status != DOCA_SUCCESS) return status;
-  status = gpuUmem(qp->gpu_dev, a->net_dev, qp->qp_umem_dbr_gpu_ptr, dbrSize, &qp->qp_umem_dbr);
+  if (cudaMemset(q->wq_mem, 0, wqSize) != cudaSuccess) return DOCA_ERROR_DRIVER;
+  status = doca_umem_gpu_create(q->gpu, a->dev, q->wq_mem, wqSize, kUmemAccess, &q->wq_umem);
   if (status != DOCA_SUCCESS) return status;
 
-  status = doca_verbs_qp_init_attr_create(&attr);
+  status = doca_gpu_mem_alloc(q->gpu, dbrSize, pageSize(), cpuRq ? DOCA_GPU_MEM_TYPE_GPU_CPU : DOCA_GPU_MEM_TYPE_GPU,
+                              &q->dbr_mem, cpuRq ? &q->dbr_cpu : nullptr);
   if (status != DOCA_SUCCESS) return status;
-  if ((status = doca_verbs_qp_init_attr_set_external_uar(attr, qp->external_uar)) != DOCA_SUCCESS ||
-      (status = doca_verbs_qp_init_attr_set_external_umem(attr, qp->qp_umem, 0)) != DOCA_SUCCESS ||
-      (status = doca_verbs_qp_init_attr_set_external_umem_dbr(attr, qp->qp_umem_dbr, 0)) != DOCA_SUCCESS ||
-      (status = doca_verbs_qp_init_attr_set_pd(attr, a->net_dev)) != DOCA_SUCCESS ||
+  if (cpuRq && q->dbr_cpu == nullptr) return DOCA_ERROR_DRIVER;
+  if (cudaMemset(q->dbr_mem, 0, dbrSize) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
+    return DOCA_ERROR_DRIVER;
+  status = doca_umem_gpu_create(q->gpu, a->dev, q->dbr_mem, dbrSize, kUmemAccess, &q->dbr_umem);
+  if (status != DOCA_SUCCESS) return status;
+
+  if ((status = doca_verbs_qp_init_attr_create(&attr)) != DOCA_SUCCESS) return status;
+  if ((status = doca_verbs_qp_init_attr_set_external_datapath_en(attr, 1)) != DOCA_SUCCESS ||
+      (status = doca_verbs_qp_init_attr_set_external_uar(attr, q->uar)) != DOCA_SUCCESS ||
+      (status = doca_verbs_qp_init_attr_set_external_umem(attr, q->wq_umem, 0)) != DOCA_SUCCESS ||
+      (status = doca_verbs_qp_init_attr_set_external_dbr_umem(attr, q->dbr_umem, 0)) != DOCA_SUCCESS ||
+      (status = doca_verbs_qp_init_attr_set_pd(attr, a->verbs_pd)) != DOCA_SUCCESS ||
       (status = doca_verbs_qp_init_attr_set_sq_wr(attr, sqN)) != DOCA_SUCCESS ||
       (status = doca_verbs_qp_init_attr_set_rq_wr(attr, rqN)) != DOCA_SUCCESS ||
-      (status = doca_verbs_qp_init_attr_set_qp_type(attr, a->qp_type)) != DOCA_SUCCESS ||
-      (status = doca_verbs_qp_init_attr_set_send_cq(attr, qp->cq_sq)) != DOCA_SUCCESS ||
-      (rqN > 0 && (status = doca_verbs_qp_init_attr_set_receive_cq(attr, qp->cq_rq)) != DOCA_SUCCESS) ||
+      (status = doca_verbs_qp_init_attr_set_qp_type(attr, a->rcx ? DOCA_VERBS_QP_TYPE_RCX : DOCA_VERBS_QP_TYPE_RC)) !=
+        DOCA_SUCCESS ||
+      (a->rcx && (status = doca_verbs_qp_init_attr_set_rcx_type(attr, 0)) != DOCA_SUCCESS) ||
+      (status = doca_verbs_qp_init_attr_set_send_cq(attr, q->cq_sq)) != DOCA_SUCCESS ||
+      (rqN > 0 && (status = doca_verbs_qp_init_attr_set_receive_cq(attr, q->cq_rq)) != DOCA_SUCCESS) ||
       (status = doca_verbs_qp_init_attr_set_send_max_sges(attr, kMaxSegs)) != DOCA_SUCCESS ||
       (status = doca_verbs_qp_init_attr_set_receive_max_sges(attr, kMaxSegs)) != DOCA_SUCCESS ||
-      (status = doca_verbs_qp_create(a->net_dev, attr, &qp->qp)) != DOCA_SUCCESS) {
+      (status = doca_verbs_qp_create(a->verbs_ctx, attr, &q->qp)) != DOCA_SUCCESS) {
     doca_verbs_qp_init_attr_destroy(attr);
     return status;
   }
   return doca_verbs_qp_init_attr_destroy(attr);
 }
 
-doca_error_t mrcQpCreate(const struct mrcQpAttr* a, struct doca_gpu_verbs_qp_hl** out) {
-  if (a == nullptr || out == nullptr || a->gpu_dev == nullptr || a->net_dev == nullptr || a->sq_nwqe == 0)
+// CPU-managed receive queue: post the whole ring once with the zero-length WQEs the work-queue
+// memset left, before the QP can receive. The CPU drain returns each credit after its CQE.
+static doca_error_t postCpuRq(struct mrcQp* q) {
+  void *sq, *rq;
+  uint32_t sqN, rqN, rwqeSize;
+  doca_verbs_qp_get_wq(q->qp, &sq, &sqN, &rq, &rqN, &rwqeSize);
+  if (rq == nullptr || rqN != q->rq_wqe_num) {
+    MRC_QP_ERR("receive queue has unexpected properties (%p, %u WQEs, expected %u)", rq, rqN, q->rq_wqe_num);
     return DOCA_ERROR_INVALID_VALUE;
-  if (a->nic_handler != DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB &&
-      a->nic_handler != DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF) {
+  }
+  volatile uint32_t* dbr = (volatile uint32_t*)q->dbr_cpu;
+  dbr[0] = htobe32(rqN & 0xffff); // receive doorbell record, then the send one
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  return DOCA_SUCCESS;
+}
+
+int mrcQpCreate(const struct mrcQpAttr* a, struct mrcQp** out) {
+  if (a == nullptr || out == nullptr || a->gpu_dev == nullptr || a->dev == nullptr || a->verbs_ctx == nullptr ||
+      a->verbs_pd == nullptr || a->sq_nwqe == 0)
+    return DOCA_ERROR_INVALID_VALUE;
+  if (a->nic_handler != MRC_QP_NIC_HANDLER_GPU_SM_DB && a->nic_handler != MRC_QP_NIC_HANDLER_GPU_SM_BF) {
     MRC_QP_ERR("nic_handler %d must be GPU_SM_DB or GPU_SM_BF", (int)a->nic_handler);
     return DOCA_ERROR_INVALID_VALUE;
   }
 
   const uint32_t sqN = nextPow2(a->sq_nwqe);
-  const uint32_t rqN = a->rq_nwqe ? nextPow2(a->rq_nwqe < kWqeBbSize / kRcvWqeSize ? kWqeBbSize / kRcvWqeSize
-                                                                                     : a->rq_nwqe)
-                                  : 0;
-  void* dbrCpuPtr = nullptr;
-  const char* step = "send CQ";
+  // At least one send WQE basic block of receive WQEs, so the send ring stays aligned.
+  const uint32_t minRq = kSndWqeSize / kRcvWqeSize;
+  const uint32_t rqN = a->rq_nwqe ? nextPow2(a->rq_nwqe < minRq ? minRq : a->rq_nwqe) : 0;
+  const char* step = "UAR";
   doca_error_t status;
 
-  struct mrcQpHl* w = (struct mrcQpHl*)calloc(1, sizeof(*w));
-  if (w == nullptr) return DOCA_ERROR_NO_MEMORY;
-  struct doca_gpu_verbs_qp_hl* qp = &w->hl;
-  qp->gpu_dev = a->gpu_dev;
-  qp->nic_handler = a->nic_handler;
-  qp->send_dbr_mode_ext = DOCA_GPUNETIO_VERBS_SEND_DBR_MODE_EXT_VALID_DBR;
+  struct mrcQp* q = (struct mrcQp*)calloc(1, sizeof(*q));
+  if (q == nullptr) return DOCA_ERROR_NO_MEMORY;
+  q->gpu = a->gpu_dev;
+  q->nic = (enum doca_gpu_dev_verbs_nic_handler)a->nic_handler;
+  q->rq_wqe_num = rqN;
 
-  if ((status = createGpuCq(qp->gpu_dev, a->net_dev, sqN, &qp->cq_sq_umem_gpu_ptr, &qp->cq_sq_umem, &qp->cq_sq)) !=
-      DOCA_SUCCESS)
-    goto fail;
+  if ((status = createUar(q, a->dev)) != DOCA_SUCCESS) goto fail;
+  step = "send CQ";
+  if ((status = createCq(q, a, sqN, false, &q->cq_sq_mem, &q->cq_sq_umem, &q->cq_sq)) != DOCA_SUCCESS) goto fail;
   step = "receive CQ";
   if (rqN > 0) {
-    status = a->rq_gpu ? createGpuCq(qp->gpu_dev, a->net_dev, rqN, &w->rq_cq_gpu_ptr, &qp->cq_rq_umem, &qp->cq_rq)
-                       : createRqCq(qp, a->net_dev, rqN);
-    if (status != DOCA_SUCCESS) goto fail;
+    q->cq_rq_host = !a->rq_gpu;
+    if ((status = createCq(q, a, rqN, q->cq_rq_host, &q->cq_rq_mem, &q->cq_rq_umem, &q->cq_rq)) != DOCA_SUCCESS)
+      goto fail;
   }
-  step = "UAR";
-  if ((status = createUar(qp, a->net_dev, a->nic_handler)) != DOCA_SUCCESS) goto fail;
   step = "QP";
-  if ((status = createQp(qp, a, sqN, rqN, &dbrCpuPtr)) != DOCA_SUCCESS) goto fail;
+  if ((status = createQp(q, a, sqN, rqN)) != DOCA_SUCCESS) goto fail;
+  step = "receive queue";
+  if (rqN > 0 && !a->rq_gpu && (status = postCpuRq(q)) != DOCA_SUCCESS) goto fail;
   step = "QP export";
-  // A GPU-managed receive queue skips the library's CPU receive setup, which writes the receive CQ
-  // from the CPU, and only attaches its CQ for doca_gpu_verbs_export_sdk_qp().
-  if ((status = doca_gpu_verbs_export_qp(qp->gpu_dev, qp->qp, qp->nic_handler, qp->qp_umem_gpu_ptr, qp->cq_sq,
-                                         a->rq_gpu ? nullptr : qp->cq_rq, dbrCpuPtr, qp->send_dbr_mode_ext,
-                                         DOCA_GPUNETIO_VERBS_CQ_64B, a->data_direct, &qp->qp_gverbs)) != DOCA_SUCCESS)
+  // The DOCA SDK handler only gets the receive CQ when device code drains it.
+  if ((status = doca_gpu_verbs_export_qp(q->gpu, a->dev, q->qp, q->nic, q->wq_mem, q->cq_sq,
+                                         a->rq_gpu ? q->cq_rq : nullptr, &q->gverbs)) != DOCA_SUCCESS)
     goto fail;
-  if (a->rq_gpu) qp->qp_gverbs->cq_rq = qp->cq_rq;
+  if ((status = doca_gpu_verbs_get_qp_dev(q->gverbs, &q->dev)) != DOCA_SUCCESS) goto fail;
 
-  *out = qp;
+  *out = q;
   return DOCA_SUCCESS;
 
 fail:
-  MRC_QP_ERR("failed to create the %s (qp type 0x%x, sq %u, rq %u): DOCA error %d", step, a->qp_type, sqN, rqN,
-             (int)status);
-  mrcQpDestroy(qp);
+  MRC_QP_ERR("failed to create the %s (%s QP, sq %u, rq %u): %s", step, a->rcx ? "RCX" : "RC", sqN, rqN,
+             doca_error_get_descr(status));
+  mrcQpDestroy(q);
   return status;
 }
 
-doca_error_t mrcQpDestroy(struct doca_gpu_verbs_qp_hl* qp) {
-  if (qp == nullptr) return DOCA_SUCCESS;
-  struct mrcQpHl* w = (struct mrcQpHl*)qp;
-  doca_gpu_t* gpu = qp->gpu_dev;
-  void* rqCq = w->rq_cq_gpu_ptr;
-  // Releases the DOCA SDK export first, then the queues; the GPU receive CQ memory goes last.
-  doca_error_t status = doca_gpu_verbs_destroy_qp_hl(qp);
-  if (status != DOCA_SUCCESS) return status;
-  if (rqCq != nullptr) doca_gpu_mem_free(gpu, rqCq);
+void mrcQpDestroy(struct mrcQp* q) {
+  if (q == nullptr) return;
+  if (q->gverbs) doca_gpu_verbs_unexport_qp(q->gpu, q->gverbs);
+  if (q->qp) doca_verbs_qp_destroy(q->qp);
+  if (q->wq_umem) doca_umem_destroy(q->wq_umem);
+  if (q->wq_mem) doca_gpu_mem_free(q->gpu, q->wq_mem);
+  if (q->dbr_umem) doca_umem_destroy(q->dbr_umem);
+  if (q->dbr_mem) doca_gpu_mem_free(q->gpu, q->dbr_mem);
+  if (q->cq_rq) doca_verbs_cq_destroy(q->cq_rq);
+  if (q->cq_rq_umem) doca_umem_destroy(q->cq_rq_umem);
+  if (q->cq_rq_mem) {
+    if (q->cq_rq_host)
+      free(q->cq_rq_mem);
+    else
+      doca_gpu_mem_free(q->gpu, q->cq_rq_mem);
+  }
+  if (q->cq_sq) doca_verbs_cq_destroy(q->cq_sq);
+  if (q->cq_sq_umem) doca_umem_destroy(q->cq_sq_umem);
+  if (q->cq_sq_mem) doca_gpu_mem_free(q->gpu, q->cq_sq_mem);
+  if (q->uar) doca_uar_destroy(q->uar);
+  free(q);
+}
+
+struct doca_verbs_qp* mrcQpVerbs(struct mrcQp* q) { return q->qp; }
+
+uint32_t mrcQpNum(struct mrcQp* q) { return doca_verbs_qp_get_qpn(q->qp); }
+
+void* mrcQpDevice(struct mrcQp* q) { return q->dev; }
+
+int mrcQpDescribe(struct mrcQp* q, struct mrcQpDesc* d) {
+  struct doca_gpu_dev_verbs_qp h;
+  memset(d, 0, sizeof(*d));
+  // The send side exactly as the SDK GPU handler drives it, including its GPU mapping of the UAR.
+  if (cudaMemcpy(&h, q->dev, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) return DOCA_ERROR_DRIVER;
+  d->qpn = h.sq_num;
+  d->sq_wqe = h.sq_wqe_daddr;
+  d->sq_wqe_num = h.sq_wqe_num;
+  d->sq_dbrec = (uint32_t*)h.sq_dbrec;
+  d->sq_db = h.sq_db;
+  d->sq_bf = h.nic_handler == DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF;
+  d->sq_cqe = h.cq_sq.cqe_daddr;
+  d->sq_cqn = h.cq_sq.cq_num;
+  d->sq_cqe_num = h.cq_sq.cqe_num;
+  d->sq_cqe_size = h.cq_sq.cqe_size;
+  d->sq_cq_dbrec = (uint32_t*)h.cq_sq.dbrec;
+
+  if (q->cq_rq_host) {
+    uint64_t* uarDb;
+    uint32_t *ciDbr, *armDbr;
+    void* cqes;
+    uint32_t n;
+    uint8_t esz;
+    doca_verbs_cq_get_wq(q->cq_rq, &cqes, &n, &esz);
+    doca_verbs_cq_get_dbr_addr(q->cq_rq, &uarDb, &ciDbr, &armDbr);
+    if (cqes != q->cq_rq_mem || n != q->rq_wqe_num || esz != sizeof(struct mlx5_cqe64)) {
+      MRC_QP_ERR("receive CQ has unexpected properties (%p/%p, %u/%u CQEs, %u B)", cqes, q->cq_rq_mem, n,
+                 q->rq_wqe_num, esz);
+      return DOCA_ERROR_INVALID_VALUE;
+    }
+    d->rq_cqe = cqes;
+    d->rq_cqe_num = n;
+    d->rq_cqe_size = esz;
+    d->rq_dbrec = (uint32_t*)q->dbr_cpu;
+    d->rq_wqe_num = q->rq_wqe_num;
+  }
   return DOCA_SUCCESS;
 }
