@@ -6,7 +6,7 @@ all: net gin
 net:
 	$(MAKE) -C src OUTPUT=../$(TARGET)
 
-# Needs the open-source DOCA GPUNetIO (DOCA_HOME) and an NCCL_HOME built with GIN_MRC=1 against it.
+# Needs the DOCA SDK (MRC_HOME) and an NCCL_HOME built with GIN_MRC=1.
 gin:
 	$(MAKE) -C src gin GIN_OUTPUT=../$(GIN_TARGET)
 
