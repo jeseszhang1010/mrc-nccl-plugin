@@ -210,8 +210,7 @@ static void applySignal(struct mrcCpuRqSignals* s, uint32_t imm) {
   const uint32_t id = (imm >> DOCA_GPUNETIO_VERBS_SIGNAL_IMM_ID_SHIFT) & DOCA_GPUNETIO_VERBS_SIGNAL_IMM_ID_MASK;
   const uint64_t val = (imm >> DOCA_GPUNETIO_VERBS_SIGNAL_IMM_VAL_SHIFT) & DOCA_GPUNETIO_VERBS_SIGNAL_IMM_VAL_MASK;
   // Undeliverable immediates are counted and consumed, so they cannot stall the queue.
-  if ((op != DOCA_GPUNETIO_VERBS_SIGNAL_OP_ADD && op != DOCA_GPUNETIO_VERBS_SIGNAL_OP_SET) || id >= s->nIds ||
-      id == s->skipId) {
+  if ((op != DOCA_GPUNETIO_VERBS_SIGNAL_OP_ADD && op != DOCA_GPUNETIO_VERBS_SIGNAL_OP_SET) || id >= s->nIds) {
     if (s->dropped++ == 0) s->droppedImm = imm;
     return;
   }

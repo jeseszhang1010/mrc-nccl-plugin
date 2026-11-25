@@ -104,6 +104,10 @@ static std::atomic<uint32_t> mrcGinRdwGen{0};
 // Register GIN windows over a NIC's Data Direct PCIe link when this GPU sits behind it. Independent
 // of NCCL_IB_DATA_DIRECT, which also moves the NET plugin and NCCL's host RMA to Data Direct.
 NCCL_PARAM(GinMrcDataDirect, "GIN_MRC_DATA_DIRECT", 1);
+// Loop the QP to the local rank through a loopback responder QP per context (an MRC QP cannot
+// target itself), so GIN puts, signals and gets to the local rank work. 0 leaves that QP
+// unconnected: two fewer connected QPs per context, and self traffic traps on the device.
+NCCL_PARAM(GinMrcSelfLoop, "GIN_MRC_SELF_LOOP", 1);
 
 /* ── CUDA memory helpers ──────────────────────────────────────────── */
 
@@ -408,9 +412,10 @@ struct mrcGinContext {
   uint32_t qpSqSize;
   uint32_t qpRqSize;
   uint8_t minRnrTimer;
-  struct mrcQp** qps; // [nContexts * (nranks + 1)]
+  struct mrcQp** qps; // [nQps]: [nContexts][nranks] per-peer QPs, then [nContexts] loopback responders if selfLoop
+  int nQps;
   // GPU RQ mode (the device code drains the receive queues): the DOCA SDK GPU handlers of the QPs,
-  // [nContexts][nranks] per-peer QPs followed by [nContexts] loopback responders.
+  // in the layout of qps.
   bool gpuRq;
   MrcHostGpuBuf<void*> sdkQps;
 
@@ -439,12 +444,6 @@ struct mrcGinContext {
   bool progressStarted;
   std::atomic<bool> progressStop;
   std::atomic<int> progressError; // first fatal error (negative errno) of the receive path (0 = healthy)
-
-  struct {
-    void* addr;
-    CUmemGenericAllocationHandle handle;
-    struct ibv_mr* mr;
-  } sink;
 
   // RDW get: request rings, descriptor staging and response landing for every context
   // (layout in gin_mrc_dev.h), one zero-based MR whose rkey is shared with every peer.
@@ -885,14 +884,13 @@ static void* mrcGinProgressMain(void* arg) {
 }
 
 // Context c's delivery target: its slice of the signal table, holding the NCCL signals and the RDW
-// counters. The sink slot between them is not a signal (see gin_mrc_dev.h).
+// counters (see gin_mrc_dev.h).
 static void mrcGinSetupSignals(struct mrcGinContext* ctx, int c, uint64_t* slots) {
   struct mrcCpuRqSignals* sigs = &ctx->sigs[c];
   memset(sigs, 0, sizeof(*sigs));
   sigs->slots = mrcCpuRqMapCpu(ctx->signalMap, slots);
   sigs->shadow = ctx->sigShadow + (size_t)c * ctx->signalTableSize;
   sigs->nIds = ctx->signalTableSize;
-  sigs->skipId = (uint32_t)ctx->nSignals;
   sigs->mcst = mrcCpuRqNeedsMcst(ctx->cudaId);
 }
 
@@ -909,15 +907,19 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
   // The device code NCCL was built with decides who drains the receive queues (gin_mrc_dev.h).
   const bool gpuRq = config->backendVersion == NCCL_GIN_MRC_VERSION_GPU_RQ;
   // CPU RQ: signals and RDW counters, each context's slice on its own 64 KiB GPU pages, the unit
-  // GDRCopy maps. GPU RQ: signals and the sink.
+  // GDRCopy maps. GPU RQ: signals.
   const unsigned int signalTableSize =
-    gpuRq ? (unsigned)nSignals + 1 : NCCL_GIN_MRC_SIGNAL_TABLE_SIZE(nSignals, nranks);
+    gpuRq ? (unsigned)nSignals : NCCL_GIN_MRC_SIGNAL_TABLE_SIZE(nSignals, nranks);
   const unsigned int kSlotsPerPinPage = 65536 / sizeof(uint64_t);
   const unsigned int signalTableStride = gpuRq ? signalTableSize : ROUNDUP(signalTableSize, kSlotsPerPinPage);
   const int64_t rqPostMode = ncclParamGinMrcRqPostMode();
   uint32_t rdwGen = 0;
   const int nqpsForComm = ncontexts * nranks;
-  const int nqps = nqpsForComm + ncontexts; // + one self-loop responder QP per context
+  // GPU RQ Data Direct flushes run on the loopback responder's send queue (gin_mrc_dev.h), so they
+  // keep the self loop.
+  const bool ddFlush = gpuRq && cComm->dd.mr != nullptr;
+  const bool selfLoop = ncclParamGinMrcSelfLoop() != 0 || ddFlush;
+  const int nqps = nqpsForComm + (selfLoop ? ncontexts : 0); // + one self-loop responder QP per context
 
   struct mrcGinContext* ctx = nullptr;
   ncclNetDeviceHandle_t* devHandle = nullptr;
@@ -963,6 +965,10 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
 
   ctx = (struct mrcGinContext*)calloc(1, sizeof(*ctx));
   if (ctx == nullptr) return ncclSystemError;
+  if (ncclParamGinMrcSelfLoop() == 0 && ddFlush)
+    WARN("GIN/MRC : NCCL_GIN_MRC_SELF_LOOP=0 ignored on %s: GPU RQ Data Direct flushes need the loopback QP "
+         "(set NCCL_GIN_MRC_DATA_DIRECT=0 to drop both)",
+         ncclIbDevs[cComm->dev].devName);
   new (&ctx->progressStop) std::atomic<bool>(false);
   new (&ctx->progressError) std::atomic<int>(0);
   ctx->collComm = cComm;
@@ -982,6 +988,7 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
 
   ctx->qps = (struct mrcQp**)calloc(nqps, sizeof(*ctx->qps));
   EQCHECKGOTO(ctx->qps, nullptr, status, out);
+  ctx->nQps = nqps;
   ctx->ctxStaging = (struct ncclGinMrcGPUContext*)calloc(ncontexts, sizeof(*ctx->ctxStaging));
   EQCHECKGOTO(ctx->ctxStaging, nullptr, status, out);
   ctx->sigs = (struct mrcCpuRqSignals*)calloc(ncontexts, sizeof(*ctx->sigs));
@@ -1012,17 +1019,11 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
   ctx->gidIndex = gidIndex;
   ctx->pkeyIndex = (int)ncclParamGinMrcPkeyIndex();
 
-  // Only the sink slots of the signal table are written by the NIC (bare-signal payloads); the
-  // rest is delivered by the device drain (GPU RQ) or the progress thread (CPU RQ).
+  // The NIC writes no slot of the signal table (a bare signal is a zero-length Write-with-Immediate),
+  // so it has no MR: the device drain (GPU RQ) or the progress thread (CPU RQ) delivers every signal.
   NCCLCHECKGOTO(ctx->counters->allocate((unsigned)nCounters * ncontexts, nranks), status, out);
   NCCLCHECKGOTO(ctx->signals->allocate(signalTableStride * ncontexts, nranks), status, out);
   NCCLCHECKGOTO(ctx->counters->registerMr(cComm->pd), status, out);
-  NCCLCHECKGOTO(ctx->signals->registerMr(cComm->pd), status, out);
-  {
-    uint32_t rkey = htobe32(ctx->signals->mr->rkey);
-    NCCLCHECKGOTO(mrcGinAllGather(cComm, &rkey, ctx->signals->rkeys.host, sizeof(uint32_t)), status, out);
-    NCCLCHECKGOTO(ctx->signals->rkeys.push(), status, out);
-  }
   if (!gpuRq && nSignals > 0) {
     CUDACHECKGOTO(cudaMalloc(&ctx->signalBase, (size_t)ncontexts * nSignals * sizeof(uint64_t)), status, out);
     CUDACHECKGOTO(cudaMemset(ctx->signalBase, 0, (size_t)ncontexts * nSignals * sizeof(uint64_t)), status, out);
@@ -1119,7 +1120,8 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
 
   // Self traffic loops through a dedicated responder QP: an MRC QP cannot target itself, and the
   // responder's receive queue takes the Write-with-Immediate signals this rank sends itself.
-  for (int ctxIdx = 0; ctxIdx < ncontexts; ctxIdx++) {
+  // Without the self loop the QP to the local rank stays unconnected.
+  for (int ctxIdx = 0; selfLoop && ctxIdx < ncontexts; ctxIdx++) {
     struct mrcGinExchInfo self;
     mrcGinFillExchInfo(&self, ctx, ctx->qps[nqpsForComm + ctxIdx]);
     NCCLCHECKGOTO(mrcGinConnectQp(ctx, ctx->qps[rank + ctxIdx * nranks], &self), status, out);
@@ -1127,18 +1129,12 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     NCCLCHECKGOTO(mrcGinConnectQp(ctx, ctx->qps[nqpsForComm + ctxIdx], &self), status, out);
   }
 
-  NCCLCHECKGOTO(mrcCuMemAlloc(&ctx->sink.addr, &ctx->sink.handle, sizeof(uint64_t)), status, out);
-  NCCLCHECKGOTO(mrcRegMr(&ctx->sink.mr, cComm->pd, ctx->sink.addr, sizeof(uint64_t),
-                         IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ),
-                status, out);
-
   // RDW get buffer: every rank uses the same layout, so a context's region sits at the same
   // offset of every peer's zero-based RDW MR. In CPU RQ mode with Data Direct it is registered like
   // the windows, so a request descriptor cannot be overtaken by the request counter the progress
   // thread delivers; in GPU RQ mode it stays on C2C, so the drain can serve a request without a flush.
   ctx->rdw.window = (uint32_t)getWindow;
-  ctx->rdw.ctxStride =
-    2 * (size_t)nranks * ctx->rdw.window * NCCL_GIN_MRC_RDW_DESC_BYTES + NCCL_GIN_MRC_RDW_DESC_BYTES;
+  ctx->rdw.ctxStride = 2 * (size_t)nranks * ctx->rdw.window * NCCL_GIN_MRC_RDW_DESC_BYTES;
   NCCLCHECKGOTO(mrcCuMemAlloc(&ctx->rdw.addr, &ctx->rdw.handle, (size_t)ncontexts * ctx->rdw.ctxStride), status, out);
   NCCLCHECKGOTO(mrcRegMr(&ctx->rdw.mr, cComm->pd, ctx->rdw.addr, (size_t)ncontexts * ctx->rdw.ctxStride,
                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE, /*forceStrictOrdering=*/true,
@@ -1182,8 +1178,8 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
 
     if (gpuRq) {
       gpuCtx->sdk_qps = ctx->sdkQps.gpu + (size_t)ctxIdx * nranks;
-      gpuCtx->self_rq_qp = ctx->sdkQps.host[nqpsForComm + ctxIdx];
-      gpuCtx->dd_flush = cComm->dd.mr != nullptr;
+      gpuCtx->self_rq_qp = selfLoop ? ctx->sdkQps.host[nqpsForComm + ctxIdx] : nullptr;
+      gpuCtx->dd_flush = ddFlush;
       gpuCtx->dd_flush_lkey = cComm->dd.mr ? htobe32(cComm->dd.mr->lkey) : 0;
       gpuCtx->rdw_gen = rdwGen;
     } else {
@@ -1199,16 +1195,13 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     NCCLCHECKGOTO(ctx->signals->take(signalTableStride, &start), status, out);
     gpuCtx->signals = ctx->signals->gpu + start;
     gpuCtx->signal_base = ctx->signalBase ? ctx->signalBase + (size_t)ctxIdx * nSignals : nullptr;
-    gpuCtx->signal_rkeys = ctx->signals->rkeys.gpu;
-    // Absolute element index within the signal MR, since it is used as a remote offset.
-    gpuCtx->signals_sink_offset = start + nSignals;
     if (!gpuRq) {
-      gpuCtx->rdw_signal_base = nSignals + 1;
+      gpuCtx->rdw_signal_base = nSignals;
       mrcGinSetupSignals(ctx, ctxIdx, gpuCtx->signals);
 
       // Peers deliver into this context through their QP to us; our own traffic through the responder.
       for (int peer = 0; peer <= nranks; peer++) {
-        if (peer == rank) continue;
+        if (peer == rank || (peer == nranks && !selfLoop)) continue;
         struct mrcCpuRq rq;
         mrcCpuRqInit(&rq, &qpDescs[peer < nranks ? ctxIdx * nranks + peer : nqpsForComm + ctxIdx]);
         ctx->rqs[ctxIdx].push_back(rq);
@@ -1216,7 +1209,7 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     }
 
     gpuCtx->peers = ctx->peers + (size_t)ctxIdx * nranks;
-    gpuCtx->sink_lkey = htobe32(ctx->sink.mr->lkey);
+    gpuCtx->self_loop_off = !selfLoop;
     gpuCtx->mr_table = cComm->mrTable.gpu;
     gpuCtx->rdw_region = (uint8_t*)ctx->rdw.addr + (size_t)ctxIdx * ctx->rdw.ctxStride;
     gpuCtx->rdw_rkeys = ctx->rdwRkeys.gpu;
@@ -1233,7 +1226,7 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
     for (int ctxIdx = 0; ctxIdx < ncontexts; ctxIdx++) {
       uint32_t* slots = ctx->counterSlots ? ctx->counterSlots + (size_t)ctxIdx * nranks * ctx->counterCap : nullptr;
       cudaError_t cerr = mrcGinInitRqsLaunch(ctx->sdkQps.gpu + (size_t)ctxIdx * nranks,
-                                             ctx->sdkQps.host[nqpsForComm + ctxIdx], rank,
+                                             selfLoop ? ctx->sdkQps.host[nqpsForComm + ctxIdx] : nullptr, rank,
                                              ctx->peers + (size_t)ctxIdx * nranks, nranks, slots, ctx->counterCap,
                                              (uint32_t)rqPostMode, 0);
       if (cerr != cudaSuccess) {
@@ -1265,9 +1258,9 @@ static ncclResult_t mrcGinCreateContext(void* collComm, ncclGinConfig_v14_t* con
 
   INFO(NCCL_INIT | NCCL_NET,
        "GIN/MRC : rank %d created %d contexts over %d ranks on %s (%s RQ, RQ depth %u, RDW get window %u, Data Direct "
-       "%s, %u signal ids per context)",
+       "%s, self loop %s, %u signal ids per context)",
        rank, ncontexts, nranks, ctx->ibDevName, gpuRq ? "GPU" : "CPU", ctx->qpRqSize, ctx->rdw.window,
-       ctx->dataDirect ? "on" : "off", signalTableSize);
+       ctx->dataDirect ? "on" : "off", selfLoop ? "on" : "off", signalTableSize);
 
 out:
   free(localInfo);
@@ -1283,7 +1276,6 @@ static ncclResult_t mrcGinDestroyContext(void* ginCtx) {
   if (ctx == nullptr) return ncclSuccess;
 
   const int ncontexts = ctx->nContexts;
-  const int nqps = ncontexts * ctx->collComm->nranks + ncontexts;
 
   // Delivery reads the signal slots and queues without locks, so it must stop before either goes away.
   if (ctx->progressStarted) {
@@ -1299,7 +1291,7 @@ static ncclResult_t mrcGinDestroyContext(void* ginCtx) {
   }
 
   if (ctx->qps) {
-    for (int qpIdx = 0; qpIdx < nqps; qpIdx++) mrcQpDestroy(ctx->qps[qpIdx]);
+    for (int qpIdx = 0; qpIdx < ctx->nQps; qpIdx++) mrcQpDestroy(ctx->qps[qpIdx]);
     free(ctx->qps);
   }
 
@@ -1325,9 +1317,6 @@ static ncclResult_t mrcGinDestroyContext(void* ginCtx) {
 
   if (ctx->peers) cudaFree(ctx->peers);
   if (ctx->counterSlots) cudaFree(ctx->counterSlots);
-
-  if (ctx->sink.mr) wrap_ibv_dereg_mr(ctx->sink.mr);
-  if (ctx->sink.addr) mrcCuMemFree(ctx->sink.addr);
 
   if (ctx->rdw.mr) wrap_ibv_dereg_mr(ctx->rdw.mr);
   if (ctx->rdw.addr) mrcCuMemFree(ctx->rdw.addr);

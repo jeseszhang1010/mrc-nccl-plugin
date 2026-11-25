@@ -22,8 +22,8 @@ extern "C" {
 // Pre-posts every peer QP's receive ring, from NCCL's own GPU RQ device code (rqInit) so that the
 // fill and the device drain always agree on the ring state. qps[peer] are the DOCA SDK GPU handles
 // of a context's QPs; the local rank's ring is selfRqQp's, the loopback responder that receives
-// this rank's own traffic. Must run before any peer issues an operation. postMode is
-// NCCL_GIN_MRC_RQ_POST_MODE_*.
+// this rank's own traffic (NULL without a self loop, leaving it unfilled). Must run before any peer
+// issues an operation. postMode is NCCL_GIN_MRC_RQ_POST_MODE_*.
 cudaError_t mrcGinInitRqsLaunch(void* const* qps, void* selfRqQp, int rank, struct ncclGinMrcPeerState* peers,
                                 int numQps, uint32_t* counterSlots, uint32_t counterCapacity, uint32_t postMode,
                                 cudaStream_t stream);

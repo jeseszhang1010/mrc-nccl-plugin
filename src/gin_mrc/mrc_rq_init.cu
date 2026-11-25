@@ -16,12 +16,13 @@
 #error "mrc_rq_init.cu must be built with -DNCCL_GIN_MRC_GPU_RQ=1"
 #endif
 
-// One thread per peer performs the single-threaded RQ fill for its slot.
+// One thread per peer performs the single-threaded RQ fill for its slot. Without a self loop
+// (selfRqQp NULL) nothing arrives for the local rank, whose ring is left unfilled.
 __global__ static void mrcGinInitRqKernel(void* const* qps, void* selfRqQp, int rank, struct ncclGinMrcPeerState* peers,
                                           int numQps, uint32_t* counterSlots, uint32_t counterCapacity,
                                           uint32_t postMode) {
   int peer = blockIdx.x * blockDim.x + threadIdx.x;
-  if (peer < numQps) {
+  if (peer < numQps && (peer != rank || selfRqQp != nullptr)) {
     uint32_t* slots = counterSlots ? counterSlots + (size_t)peer * counterCapacity : nullptr;
     void* qp = peer == rank ? selfRqQp : qps[peer];
     nccl::gin::mrc::rqInit((struct doca_gpu_dev_verbs_qp*)qp, &peers[peer], slots, counterCapacity, postMode);

@@ -13,6 +13,7 @@
  * round trip, each half crossing a CPU delivery) and the streaming rate.
  *
  * Usage: rcx_loopback [-d mlx5_0] [-g 0] [-x 3] [-t rcx|rc] [-n iters] [-s bytes] [-z]
+ *   -s 0 sends zero-length Write-with-Immediate (signals without data)
  ************************************************************************/
 
 #include <endian.h>
@@ -125,7 +126,7 @@ __global__ void pingPong(doca_gpu_dev_verbs_qp* qpA, doca_gpu_dev_verbs_qp* qpB,
                                                                                           &t);
     while (loadSys(sigAtB) < (uint64_t)i + 1) {
     }
-    if (*(volatile uint8_t*)bufB != (uint8_t)i) {
+    if (bytes > 0 && *(volatile uint8_t*)bufB != (uint8_t)i) {
       printf("ping %d: payload %u not visible with its signal\n", i, *(volatile uint8_t*)bufB);
       out[1] = 1;
     }
@@ -253,7 +254,6 @@ int main(int argc, char** argv) {
   }
   const int threads = 128;
   const size_t bufBytes = 1 << 26;
-  CHECK(bytes > 0, "MRC rejects zero-length Write-with-Immediate");
   CHECK(bytes * threads <= bufBytes, "message too large");
 
   CUDA_OK(cudaSetDevice(gpu));
@@ -318,7 +318,6 @@ int main(int argc, char** argv) {
   prog.sigs.slots = mrcCpuRqMapCpu(map, sigs);
   prog.sigs.shadow = shadow;
   prog.sigs.nIds = kNumSigs;
-  prog.sigs.skipId = UINT32_MAX;
   prog.sigs.mcst = mrcCpuRqNeedsMcst(gpu);
   prog.strongFence = dataDirect;
   pthread_t thr;

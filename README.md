@@ -25,7 +25,7 @@ The two modes differ in who drains those receive queues (RQs) and applies the si
 | Host CPU cost | One busy-polling thread per GIN context set (per device communicator and NIC) | None |
 | Progress | Signals are applied even if no kernel is running on the receiver | Signals are applied only while some kernel on the receiver drives GIN progress |
 | Defaults (`NCCL_GIN_MRC_RQ_DEPTH`, `NCCL_GIN_MRC_MIN_RNR_TIMER`) | 1024, 1 (0.01 ms) | SQ depth, 12 (0.64 ms) |
-| Backend version NCCL reports to the plugin | 7 | 8 |
+| Backend version NCCL reports to the plugin | 9 | 10 |
 
 The mode is fixed when NCCL is built. **One plugin binary serves both modes**: NCCL reports its mode
 to the plugin as the backend version, and the plugin follows it per communicator. To switch modes at
@@ -154,7 +154,7 @@ Data Direct), and returns the receive credits, with the same semantics as the op
 
 With `GIN_MRC_RQ=gpu`, NCCL drives the DOCA SDK GPU handlers of the QPs (`doca_gpu_verbs_export_qp`),
 whose receive CQs are in GPU memory. The signal immediate rides the last Write-with-Immediate of the put's data
-(8-byte writes to a sink carry signals without data and the further chunks of a large Add). The GPU drains the receive CQs whenever it reads or waits on a signal or counter,
+(zero-length Write-with-Immediates carry signals without data and the further chunks of a large Add). The GPU drains the receive CQs whenever it reads or waits on a signal or counter,
 applies the signal operations and reposts the receive WQEs (`NCCL_GIN_MRC_RQ_POST_MODE`). No CPU thread
 is involved, but a signal is only applied while some kernel on the receiver drives GIN progress.
 

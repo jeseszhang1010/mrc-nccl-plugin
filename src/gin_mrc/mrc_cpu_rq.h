@@ -46,12 +46,11 @@ void mrcCpuRqMapDestroy(struct mrcCpuRqMap* map);
 // Whether the GPU needs a read of a slot before the CPU writes it (no GPUDirect RDMA write ordering).
 bool mrcCpuRqNeedsMcst(int cudaDev);
 
-// Delivery target of a set of receive queues: signal ids [0, nIds) at slots[id], except skipId.
+// Delivery target of a set of receive queues: signal ids [0, nIds) at slots[id].
 struct mrcCpuRqSignals {
   volatile uint64_t* slots; // CPU mapping of the GPU slots
   uint64_t* shadow;         // [nIds] last value written to each slot
   uint32_t nIds;
-  uint32_t skipId; // not a signal (the sink slot of bare signals)
   bool mcst;
   uint64_t dropped;     // undeliverable immediates, consumed
   uint32_t droppedImm;  // the first of them
