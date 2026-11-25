@@ -10,13 +10,10 @@ net:
 gin:
 	$(MAKE) -C src gin GIN_OUTPUT=../$(GIN_TARGET)
 
-gin-test:
-	$(MAKE) -C src gin-test
-
 clean:
 	$(MAKE) -C src OUTPUT=../$(TARGET) GIN_OUTPUT=../$(GIN_TARGET) clean
 
 test: net
 	$(MAKE) -C tests PLUGIN=$(abspath $(TARGET)) test
 
-.PHONY: all net gin gin-test clean test
+.PHONY: all net gin clean test

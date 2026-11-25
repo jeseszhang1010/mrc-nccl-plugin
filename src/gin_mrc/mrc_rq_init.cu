@@ -1,9 +1,8 @@
 /*************************************************************************
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * GPU RQ mode receive-ring fill (see mrc_rq_init.h). Compiled with NCCL's GPU RQ
- * device code (NCCL_GIN_MRC_GPU_RQ=1) and the DOCA SDK device headers, whatever
- * mode the NCCL install was built with.
+ * Receive-ring fill (see mrc_rq_init.h). Compiled with NCCL's device code and
+ * the DOCA SDK device headers.
  ************************************************************************/
 
 #include <cuda_runtime.h>
@@ -11,10 +10,6 @@
 #include "nccl_device/gin/mrc/gin_mrc.h"
 
 #include "mrc_rq_init.h"
-
-#if !NCCL_GIN_MRC_GPU_RQ
-#error "mrc_rq_init.cu must be built with -DNCCL_GIN_MRC_GPU_RQ=1"
-#endif
 
 // One thread per peer performs the single-threaded RQ fill for its slot. Without a self loop
 // (selfRqQp NULL) nothing arrives for the local rank, whose ring is left unfilled.

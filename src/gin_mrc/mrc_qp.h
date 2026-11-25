@@ -6,19 +6,11 @@
  *
  * The send queue and its CQ live in GPU memory and are driven by device code.
  * Every QP is exported to the DOCA SDK GPU handler (doca_gpu_verbs_export_qp).
- * The receive queue is either:
- *   - GPU managed: the receive CQ is in GPU memory and is exported with the
- *     QP, so DOCA SDK device code posts and drains the receive queue
- *     through the SDK GPU handler (mrcQpDevice).
- *   - CPU managed: the receive CQ is in host memory and the doorbell record
- *     is GDRCopy-mapped GPU memory. The receive ring is posted once with
- *     zero-length WQEs at creation, and the plugin drains the CQ and returns
- *     the credits on the CPU (mrc_cpu_rq.h). Device code driving the send
- *     queue with the open-source GPUNetIO gets its handler from the
- *     description (mrcQpDescribe).
+ * The receive queue is GPU managed: the receive CQ is in GPU memory and is
+ * exported with the QP, so DOCA SDK device code posts and drains the receive
+ * queue through the SDK GPU handler (mrcQpDevice).
  *
- * The header only forward-declares the DOCA types, so it can be included
- * next to either the DOCA SDK or the open-source GPUNetIO headers.
+ * The header only forward-declares the DOCA types.
  ************************************************************************/
 
 #ifndef MRC_QP_H_
@@ -26,8 +18,6 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-
-#include "mrc_qp_desc.h"
 
 struct doca_gpu;
 struct doca_dev;
@@ -52,7 +42,6 @@ struct mrcQpAttr {
   uint32_t sq_nwqe; // rounded up to a power of two
   uint32_t rq_nwqe; // rounded up to a power of two; 0 = no receive queue
   enum mrcQpNicHandler nic_handler;
-  bool rq_gpu; // GPU-managed receive queue, see above
 };
 
 struct mrcQp;
@@ -65,8 +54,6 @@ struct doca_verbs_qp* mrcQpVerbs(struct mrcQp* qp);
 uint32_t mrcQpNum(struct mrcQp* qp);
 // GPU pointer to the DOCA SDK struct doca_gpu_dev_verbs_qp of the QP.
 void* mrcQpDevice(struct mrcQp* qp);
-// Queue addresses for device code built on the open-source GPUNetIO and for the CPU receive path.
-int mrcQpDescribe(struct mrcQp* qp, struct mrcQpDesc* desc);
 
 #ifdef __cplusplus
 }
