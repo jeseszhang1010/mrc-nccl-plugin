@@ -43,15 +43,14 @@ struct mrcQp {
   struct doca_umem* cq_sq_umem;
 
   struct doca_verbs_cq* cq_rq;
-  void* cq_rq_mem; // GPU (GPU RQ) or host (CPU RQ)
-  bool cq_rq_host;
+  void* cq_rq_mem; // host
   struct doca_umem* cq_rq_umem;
 
   struct doca_verbs_qp* qp;
   void* wq_mem; // GPU: receive ring, then send ring
   struct doca_umem* wq_umem;
   void* dbr_mem; // GPU
-  void* dbr_cpu; // CPU mapping of dbr_mem (CPU RQ)
+  void* dbr_cpu; // CPU mapping of dbr_mem
   struct doca_umem* dbr_umem;
   uint32_t rq_wqe_num;
 
@@ -131,13 +130,13 @@ static doca_error_t createCq(struct mrcQp* q, const struct mrcQpAttr* a, uint32_
   return doca_verbs_cq_attr_destroy(attr);
 }
 
-// Work queues and doorbell record in GPU memory. With a CPU-managed receive queue the doorbell
-// record is GDRCopy-mapped: the NIC and the GPU use its GPU address, and the CPU returns receive
-// credits through the mapping.
+// Work queues and doorbell record in GPU memory. With a receive queue the doorbell record is
+// GDRCopy-mapped: the NIC and the GPU use its GPU address, and the CPU returns receive credits
+// through the mapping.
 static doca_error_t createQp(struct mrcQp* q, const struct mrcQpAttr* a, uint32_t sqN, uint32_t rqN) {
   const uint32_t wqSize = alignUp(alignUp(rqN * kRcvWqeSize, kSndWqeSize) + sqN * kSndWqeSize, (uint32_t)pageSize());
   const uint32_t dbrSize = alignUp(kDbrSize, (uint32_t)pageSize());
-  const bool cpuRq = rqN > 0 && !a->rq_gpu;
+  const bool cpuRq = rqN > 0;
   struct doca_verbs_qp_init_attr* attr = nullptr;
   doca_error_t status;
 
@@ -220,19 +219,16 @@ int mrcQpCreate(const struct mrcQpAttr* a, struct mrcQp** out) {
   step = "send CQ";
   if ((status = createCq(q, a, sqN, false, &q->cq_sq_mem, &q->cq_sq_umem, &q->cq_sq)) != DOCA_SUCCESS) goto fail;
   step = "receive CQ";
-  if (rqN > 0) {
-    q->cq_rq_host = !a->rq_gpu;
-    if ((status = createCq(q, a, rqN, q->cq_rq_host, &q->cq_rq_mem, &q->cq_rq_umem, &q->cq_rq)) != DOCA_SUCCESS)
-      goto fail;
-  }
+  if (rqN > 0 && (status = createCq(q, a, rqN, true, &q->cq_rq_mem, &q->cq_rq_umem, &q->cq_rq)) != DOCA_SUCCESS)
+    goto fail;
   step = "QP";
   if ((status = createQp(q, a, sqN, rqN)) != DOCA_SUCCESS) goto fail;
   step = "receive queue";
-  if (rqN > 0 && !a->rq_gpu && (status = postCpuRq(q)) != DOCA_SUCCESS) goto fail;
+  if (rqN > 0 && (status = postCpuRq(q)) != DOCA_SUCCESS) goto fail;
   step = "QP export";
-  // The DOCA SDK handler only gets the receive CQ when device code drains it.
-  if ((status = doca_gpu_verbs_export_qp(q->gpu, a->dev, q->qp, q->nic, q->wq_mem, q->cq_sq,
-                                         a->rq_gpu ? q->cq_rq : nullptr, &q->gverbs)) != DOCA_SUCCESS)
+  // The DOCA SDK handler gives mrcQpDescribe the send side; the CPU drains the receive CQ.
+  if ((status = doca_gpu_verbs_export_qp(q->gpu, a->dev, q->qp, q->nic, q->wq_mem, q->cq_sq, nullptr,
+                                         &q->gverbs)) != DOCA_SUCCESS)
     goto fail;
   if ((status = doca_gpu_verbs_get_qp_dev(q->gverbs, &q->dev)) != DOCA_SUCCESS) goto fail;
 
@@ -256,12 +252,7 @@ void mrcQpDestroy(struct mrcQp* q) {
   if (q->dbr_mem) doca_gpu_mem_free(q->gpu, q->dbr_mem);
   if (q->cq_rq) doca_verbs_cq_destroy(q->cq_rq);
   if (q->cq_rq_umem) doca_umem_destroy(q->cq_rq_umem);
-  if (q->cq_rq_mem) {
-    if (q->cq_rq_host)
-      free(q->cq_rq_mem);
-    else
-      doca_gpu_mem_free(q->gpu, q->cq_rq_mem);
-  }
+  free(q->cq_rq_mem);
   if (q->cq_sq) doca_verbs_cq_destroy(q->cq_sq);
   if (q->cq_sq_umem) doca_umem_destroy(q->cq_sq_umem);
   if (q->cq_sq_mem) doca_gpu_mem_free(q->gpu, q->cq_sq_mem);
@@ -272,8 +263,6 @@ void mrcQpDestroy(struct mrcQp* q) {
 struct doca_verbs_qp* mrcQpVerbs(struct mrcQp* q) { return q->qp; }
 
 uint32_t mrcQpNum(struct mrcQp* q) { return doca_verbs_qp_get_qpn(q->qp); }
-
-void* mrcQpDevice(struct mrcQp* q) { return q->dev; }
 
 int mrcQpDescribe(struct mrcQp* q, struct mrcQpDesc* d) {
   struct doca_gpu_dev_verbs_qp h;
@@ -292,7 +281,7 @@ int mrcQpDescribe(struct mrcQp* q, struct mrcQpDesc* d) {
   d->sq_cqe_size = h.cq_sq.cqe_size;
   d->sq_cq_dbrec = (uint32_t*)h.cq_sq.dbrec;
 
-  if (q->cq_rq_host) {
+  if (q->cq_rq) {
     uint64_t* uarDb;
     uint32_t *ciDbr, *armDbr;
     void* cqes;

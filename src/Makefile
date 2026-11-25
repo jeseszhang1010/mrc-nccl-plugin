@@ -45,12 +45,11 @@ GIT_VERSION_FILE := $(OBJDIR)/include/nccl_git_version.h
 
 # GIN plugin: the net_ib device discovery above plus the MRC QP code, built on the DOCA SDK in
 # MRC_HOME (verbs and GPUNetIO: the RCX QP type is a DOCA SDK feature). NCCL_HOME is an NCCL built
-# with GIN_MRC=1; the plugin follows the receive-queue mode it was built with (GIN_MRC_RQ):
-#   cpu: NCCL's device code is the open-source GPUNetIO it embeds. mrc_cpu_rq.cc lays out its device
-#        QPs and decodes its signal immediates with the open-source GPUNetIO headers NCCL installs
-#        (NCCL_DOCA_OSS_INC), never next to the DOCA SDK headers: they share include guards. Pass
-#        the same immediate layout as NCCL (e.g. -DDOCA_GPUNETIO_VERBS_SIGNAL_IMM_VAL_SHIFT=24) in CXXFLAGS.
-#   gpu: NCCL's device code uses the DOCA SDK device headers, as does the receive-ring fill kernel.
+# with GIN_MRC=1 from the same (CPU RQ) branch. NCCL's device code is the open-source GPUNetIO it
+# embeds: mrc_cpu_rq.cc lays out its device QPs and decodes its signal immediates with the
+# open-source GPUNetIO headers NCCL installs (NCCL_DOCA_OSS_INC), never next to the DOCA SDK headers:
+# they share include guards. Pass the same immediate layout as NCCL (e.g.
+# -DDOCA_GPUNETIO_VERBS_SIGNAL_IMM_VAL_SHIFT=24) in CXXFLAGS.
 GIN_OUTPUT ?= ../libnccl-gin-mrc.so
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 # GB200 by default; override for other architectures.
@@ -61,9 +60,8 @@ GIN_OSS_SRCS := gin_mrc/mrc_cpu_rq.cc
 GIN_SDK_SRCS := $(filter-out $(GIN_OSS_SRCS),$(wildcard gin_mrc/*.cc))
 GIN_SDK_OBJS := $(GIN_SDK_SRCS:%.cc=$(OBJDIR)/%.o)
 GIN_OSS_OBJS := $(GIN_OSS_SRCS:%.cc=$(OBJDIR)/%.o)
-GIN_CU_OBJS := $(OBJDIR)/gin_mrc/mrc_rq_init.o
-GIN_OBJS := $(OBJS) $(GIN_SDK_OBJS) $(GIN_OSS_OBJS) $(GIN_CU_OBJS)
-DEPS += $(GIN_SDK_OBJS:.o=.d) $(GIN_OSS_OBJS:.o=.d) $(GIN_CU_OBJS:.o=.d)
+GIN_OBJS := $(OBJS) $(GIN_SDK_OBJS) $(GIN_OSS_OBJS)
+DEPS += $(GIN_SDK_OBJS:.o=.d) $(GIN_OSS_OBJS:.o=.d)
 GIN_LDLIBS := $(LDLIBS) -lcuda -ldoca_verbs -ldoca_gpunetio -ldoca_common
 
 # NCCL's bundled mlx5dvcore.h would clash with the system mlx5dv.h the DOCA SDK headers include.
@@ -87,14 +85,6 @@ $(GIN_OSS_OBJS): $(OBJDIR)/%.o: %.cc Makefile
 	@[ -f $(NCCL_DOCA_OSS_INC)/common/doca_gpunetio_verbs_dev.h ] || \
 	  { echo "NCCL_HOME=$(NCCL_HOME) has no open-source GPUNetIO headers (build NCCL with GIN_MRC=1)"; exit 1; }
 	$(CXX) $(CXXFLAGS) -Igin_mrc -I$(NCCL_DOCA_OSS_INC) -I$(CUDA_HOME)/include -MMD -MP -c $< -o $@
-
-# GPU RQ receive-ring fill: NCCL's GPU RQ device code over the DOCA SDK device headers, whatever
-# mode NCCL_HOME was built with.
-$(OBJDIR)/gin_mrc/mrc_rq_init.o: gin_mrc/mrc_rq_init.cu gin_mrc/mrc_rq_init.h Makefile
-	@printf "Compiling  %-35s > %s\n" $< $@
-	@mkdir -p $(dir $@)
-	$(NVCC) -Igin_mrc -I$(NCCL_HOME)/include -I$(MRC_HOME)/include -DNCCL_GIN_MRC_ENABLE=1 -DNCCL_GIN_MRC_GPU_RQ=1 \
-	  $(NVCC_GENCODE) -std=c++17 -Xcompiler -fPIC -MMD -MP -c $< -o $@
 
 # Single-node RCX loopback check of put_immediate + CPU signal delivery (see the test source).
 GIN_TEST ?= ../gin_mrc_rcx_loopback
