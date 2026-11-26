@@ -18,7 +18,7 @@ On this branch the receive queues are managed by the CPU:
 * A progress thread of the GIN plugin drains the receive CQs, which are in host memory, and adds each
   signal value to its GPU slot through GDRCopy. Signals are applied even if no kernel is running on the
   receiver.
-* NCCL's device code is the open-source GPUNetIO (`doca_gpu_dev_verbs_put_immediate`) from `DOCA_HOME`.
+* NCCL's device code is the open-source GPUNetIO (`doca_gpu_dev_verbs_put_immediate`) that NCCL bundles.
 * GDRCopy is required on every node, with forced-PCIe support for Data Direct.
 * It costs one busy-polling host thread per GIN context set (per device communicator and NIC).
 * Defaults: `NCCL_GIN_MRC_RQ_DEPTH` 1024, `NCCL_GIN_MRC_MIN_RNR_TIMER` 1 (0.01 ms).
@@ -64,22 +64,23 @@ rewriting a shared object. The output libraries are `libnccl-net-mrc.so` and `li
 The device half of the MRC GIN backend lives in NCCL (branch `mrc-gin-v2.32.6-cpu-rq`) and is opt-in
 (`GIN_MRC=1`).
 
-**Step 1: build NCCL.** You need `DOCA_HOME`: an open-source GPUNetIO checkout
-([NVIDIA-DOCA/gpunetio](https://github.com/NVIDIA-DOCA/gpunetio) `main`) with
-`doca_gpu_dev_verbs_put_immediate`. Its device headers are installed with NCCL's, and the GIN plugin's
-CPU RQ code compiles against them. `build-nccl-gin-mrc.sh` in the NCCL tree builds NCCL and rebuilds
-`docs/examples` in place against it:
+**Step 1: build NCCL.** The device code uses the open-source GPUNetIO that NCCL bundles (updated to
+[NVIDIA-DOCA/gpunetio](https://github.com/NVIDIA-DOCA/gpunetio) `main`, which has
+`doca_gpu_dev_verbs_put_immediate`). Its device headers are installed with NCCL's, and the GIN plugin's
+CPU RQ code compiles against them. To use another open-source GPUNetIO tree instead, pass
+`DOCA_HOME=/path/to/gpunetio`; it must have `put_immediate`. `build-nccl-gin-mrc.sh` in the NCCL tree
+builds NCCL and rebuilds `docs/examples` in place against it:
 
 ```bash
 cd /path/to/nccl
-BUILD_DIR=$PWD/build DOCA_HOME=/path/to/gpunetio ./build-nccl-gin-mrc.sh
+BUILD_DIR=$PWD/build ./build-nccl-gin-mrc.sh
 ```
 
 Without the script, build NCCL with the following. The script uses the same flags, with
 `NVCC_GENCODE` fixed to GB200 (`sm_100`):
 
 ```bash
-make -j src.build BUILDDIR=$PWD/build GIN_MRC=1 DOCA_HOME=/path/to/gpunetio \
+make -j src.build BUILDDIR=$PWD/build GIN_MRC=1 \
   NVCC_GENCODE="-gencode=arch=compute_100,code=sm_100"
 ```
 
